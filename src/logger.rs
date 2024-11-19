@@ -61,7 +61,7 @@ pub(crate) struct LogFacadeLogger {
 pub(crate) enum Writer {
 	/// Writes logs to the file system.
 	FileWriter(FilesystemLogger),
-	/// Fowards logs to the `log` facade.
+	/// Forwards logs to the `log` facade.
 	LogFacadeWriter(LogFacadeLogger),
 }
 
