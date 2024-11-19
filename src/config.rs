@@ -430,7 +430,7 @@ impl From<MaxDustHTLCExposure> for LdkMaxDustHTLCExposure {
 }
 
 /// Configuration options for logging to the filesystem.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FilesystemLoggerConfig {
 	/// The log file path.
 	///
@@ -442,7 +442,7 @@ pub struct FilesystemLoggerConfig {
 }
 
 /// Configuration options for logging to the `log` facade.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogFacadeLoggerConfig {
 	/// This specifies the log level.
 	pub level: LdkLevel,
