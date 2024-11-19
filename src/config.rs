@@ -441,6 +441,13 @@ pub struct FilesystemLoggerConfig {
 	pub level: LdkLevel,
 }
 
+/// Configuration options for logging to the `log` facade.
+#[derive(Debug)]
+pub struct LogFacadeLoggerConfig {
+	/// This specifies the log level.
+	pub level: LdkLevel,
+}
+
 impl Default for FilesystemLoggerConfig {
 	fn default() -> Self {
 		let log_file_path = format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILE_PATH);
