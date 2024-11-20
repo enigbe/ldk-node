@@ -13,9 +13,11 @@ pub use lightning::util::logger::Level as LdkLevel;
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 
+use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 /// A unit of logging output with Metadata to enable filtering Module_path,
 /// file, line to inform on log's source.
@@ -43,26 +45,31 @@ impl<'a> From<Record<'a>> for LogRecord {
 
 /// LogWriter trait encapsulating the operations required of a
 /// logger's writer.
-pub trait LogWriter: Send + Sync {
+pub trait LogWriter: Send + Sync + Debug {
 	/// Log the record.
 	fn log(&self, record: LogRecord);
 }
 
+#[derive(Debug)]
 pub(crate) struct FilesystemLogger {
 	file_path: String,
 	level: LdkLevel,
 }
 
+#[derive(Debug)]
 pub(crate) struct LogFacadeLogger {
 	level: LdkLevel,
 }
 
 /// Defines a writer for [`Logger`].
+#[derive(Debug)]
 pub(crate) enum Writer {
 	/// Writes logs to the file system.
 	FileWriter(FilesystemLogger),
 	/// Forwards logs to the `log` facade.
 	LogFacadeWriter(LogFacadeLogger),
+	/// Forwards logs to custom writer.
+	CustomWriter(Arc<dyn LogWriter + Send + Sync>),
 }
 
 impl LogWriter for Writer {
@@ -99,6 +106,7 @@ impl LogWriter for Writer {
 				LdkLevel::Warn => warn!("{}", log),
 				LdkLevel::Error => error!("{}", log),
 			},
+			Writer::CustomWriter(custom_logger) => custom_logger.log(record),
 		}
 	}
 }
@@ -133,6 +141,10 @@ impl Logger {
 		let log_facade_writer = LogFacadeLogger { level };
 
 		Ok(Self { writer: Writer::LogFacadeWriter(log_facade_writer) })
+	}
+
+	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter + Send + Sync>) -> Result<Self, ()> {
+		Ok(Self { writer: Writer::CustomWriter(log_writer) })
 	}
 }
 
