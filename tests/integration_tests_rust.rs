@@ -801,7 +801,10 @@ fn simple_bolt12_send_receive() {
 fn generate_bip21_uri() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
-	let log_writer = TestLogWriter::File(FilesystemLoggerConfig::default());
+
+	// Setup custom logger.
+	let mock_logger = init_mock_logger(log::LevelFilter::Trace);
+	let log_writer = TestLogWriter::Custom(mock_logger.clone());
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false, log_writer);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
@@ -838,6 +841,8 @@ fn generate_bip21_uri() {
 		},
 		Err(e) => panic!("Failed to generate URI: {:?}", e),
 	}
+
+	assert!(mock_logger.retrieve_logs().last().unwrap().contains("Invoice created: lnbcrt"));
 }
 
 #[test]
@@ -845,6 +850,7 @@ fn unified_qr_send_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
 
+	// Setup `log` facade logger.
 	let mock_logger = init_mock_logger(log::LevelFilter::Trace);
 	let log_writer = TestLogWriter::LogFacade(LogFacadeLoggerConfig { level: LdkLevel::Trace });
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false, log_writer);
