@@ -312,10 +312,15 @@ impl LogWriter for MockLogger {
 	}
 }
 
-pub(crate) fn init_mock_logger(level: LevelFilter) -> Arc<MockLogger> {
+pub(crate) fn init_log_logger(level: LevelFilter) -> Arc<MockLogger> {
 	let logger = Arc::new(MockLogger::new());
 	log::set_boxed_logger(Box::new(logger.clone())).unwrap();
 	log::set_max_level(level);
+	logger
+}
+
+pub(crate) fn init_custom_logger() -> Arc<MockLogger> {
+	let logger = Arc::new(MockLogger::new());
 	logger
 }
 
