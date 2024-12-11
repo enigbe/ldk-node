@@ -8,7 +8,7 @@
 pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record};
 pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
 
-pub use lightning::util::logger::Level as LdkLevel;
+pub use lightning::util::logger::Level as LogLevel;
 
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// file, line to inform on log's source.
 pub struct LogRecord {
 	/// The verbosity level of the message.
-	pub level: LdkLevel,
+	pub level: LogLevel,
 	/// The message body.
 	pub args: String,
 	/// The module path of the message.
@@ -53,12 +53,12 @@ pub trait LogWriter: Send + Sync + Debug {
 #[derive(Debug)]
 pub(crate) struct FilesystemLogger {
 	file_path: String,
-	level: LdkLevel,
+	level: LogLevel,
 }
 
 #[derive(Debug)]
 pub(crate) struct LogFacadeLogger {
-	level: LdkLevel,
+	level: LogLevel,
 }
 
 /// Defines a writer for [`Logger`].
@@ -99,12 +99,12 @@ impl LogWriter for Writer {
 					.expect("Failed to write to log file")
 			},
 			Writer::LogFacadeWriter(log_facade_logger) => match log_facade_logger.level {
-				LdkLevel::Gossip => trace!("{}", log),
-				LdkLevel::Trace => trace!("{}", log),
-				LdkLevel::Debug => debug!("{}", log),
-				LdkLevel::Info => info!("{}", log),
-				LdkLevel::Warn => warn!("{}", log),
-				LdkLevel::Error => error!("{}", log),
+				LogLevel::Gossip => trace!("{}", log),
+				LogLevel::Trace => trace!("{}", log),
+				LogLevel::Debug => debug!("{}", log),
+				LogLevel::Info => info!("{}", log),
+				LogLevel::Warn => warn!("{}", log),
+				LogLevel::Error => error!("{}", log),
 			},
 			Writer::CustomWriter(custom_logger) => custom_logger.log(record),
 		}
@@ -119,7 +119,7 @@ pub(crate) struct Logger {
 impl Logger {
 	/// Creates a new logger with a filesystem writer. The parameters to this function
 	/// are the path to the log file, and the log level.
-	pub fn new_fs_writer(log_file_path: String, level: LdkLevel) -> Result<Self, ()> {
+	pub fn new_fs_writer(log_file_path: String, level: LogLevel) -> Result<Self, ()> {
 		if let Some(parent_dir) = Path::new(&log_file_path).parent() {
 			fs::create_dir_all(parent_dir)
 				.map_err(|e| eprintln!("ERROR: Failed to create log parent directory: {}", e))?;
@@ -137,7 +137,7 @@ impl Logger {
 		Ok(Self { writer: Writer::FileWriter(fs_writer) })
 	}
 
-	pub fn new_log_facade(level: LdkLevel) -> Result<Self, ()> {
+	pub fn new_log_facade(level: LogLevel) -> Result<Self, ()> {
 		let log_facade_writer = LogFacadeLogger { level };
 
 		Ok(Self { writer: Writer::LogFacadeWriter(log_facade_writer) })

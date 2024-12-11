@@ -17,7 +17,7 @@ use common::{
 
 use ldk_node::config::{EsploraSyncConfig, FilesystemLoggerConfig};
 use ldk_node::payment::{PaymentKind, QrPaymentResult, SendingParameters};
-use ldk_node::LdkLevel;
+use ldk_node::LogLevel;
 use ldk_node::{Builder, Event, LogFacadeLoggerConfig, NodeError};
 
 use lightning::ln::channelmanager::PaymentId;
@@ -848,7 +848,7 @@ fn unified_qr_send_receive() {
 
 	// Setup `log` facade logger.
 	let mock_logger = init_log_logger(log::LevelFilter::Trace);
-	let log_writer = TestLogWriter::LogFacade(LogFacadeLoggerConfig { level: LdkLevel::Trace });
+	let log_writer = TestLogWriter::LogFacade(LogFacadeLoggerConfig { level: LogLevel::Trace });
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false, log_writer);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
