@@ -11,10 +11,11 @@
 use chrono::Utc;
 use ldk_node::config::{Config, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
+use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
-	Builder, CustomTlvRecord, Event, FilesystemLoggerConfig, LightningBalance,
-	LogFacadeLoggerConfig, LogRecord, LogWriter, Node, NodeError, PendingSweepBalance,
+	Builder, CustomTlvRecord, Event, FilesystemLoggerConfig, LightningBalance, Node, NodeError,
+	PendingSweepBalance,
 };
 
 use lightning::ln::msgs::SocketAddress;
@@ -257,7 +258,7 @@ pub(crate) enum TestChainSource<'a> {
 #[derive(Clone)]
 pub(crate) enum TestLogWriter {
 	File(FilesystemLoggerConfig),
-	LogFacade(LogFacadeLoggerConfig),
+	LogFacade(LogLevel),
 	Custom(Arc<dyn LogWriter + Send + Sync>),
 }
 
@@ -390,8 +391,8 @@ pub(crate) fn setup_node(
 		TestLogWriter::File(fs_config) => {
 			builder.set_filesystem_logger(fs_config);
 		},
-		TestLogWriter::LogFacade(lf_config) => {
-			builder.set_log_facade_logger(lf_config);
+		TestLogWriter::LogFacade(log_level) => {
+			builder.set_log_facade_logger(log_level);
 		},
 		TestLogWriter::Custom(log_writer) => {
 			builder.set_custom_logger(log_writer);

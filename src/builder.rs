@@ -7,8 +7,8 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_user_config, Config, EsploraSyncConfig, FilesystemLoggerConfig, LogFacadeLoggerConfig,
-	WALLET_KEYS_SEED_LEN,
+	default_log_file_path, default_log_level, default_user_config, Config, EsploraSyncConfig,
+	FilesystemLoggerConfig, WALLET_KEYS_SEED_LEN,
 };
 
 use crate::connection::ConnectionManager;
@@ -19,7 +19,7 @@ use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
 use crate::liquidity::LiquiditySource;
-use crate::logger::{log_error, log_info, LdkLogger, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::store::PaymentStore;
 use crate::peer_store::PeerStore;
@@ -109,10 +109,10 @@ impl Default for LiquiditySourceConfig {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum LogWriterConfig {
 	File(FilesystemLoggerConfig),
-	Log(LogFacadeLoggerConfig),
+	Log(LogLevel),
 	Custom(Arc<dyn LogWriter + Send + Sync>),
 }
 
@@ -324,8 +324,8 @@ impl NodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the `log` facade.
-	pub fn set_log_facade_logger(&mut self, lf_config: LogFacadeLoggerConfig) -> &mut Self {
-		self.log_writer_config = Some(LogWriterConfig::Log(lf_config));
+	pub fn set_log_facade_logger(&mut self, log_level: LogLevel) -> &mut Self {
+		self.log_writer_config = Some(LogWriterConfig::Log(log_level));
 		self
 	}
 
@@ -416,9 +416,7 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		use bitcoin::key::Secp256k1;
 
-		let writer = LogWriterConfig::default();
-		let log_writer_config =
-			if let Some(config) = &self.log_writer_config { config } else { &writer };
+		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
 		let logger = setup_logger(&log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
@@ -484,9 +482,7 @@ impl NodeBuilder {
 	pub fn build_with_vss_store_and_header_provider(
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
-		let writer = LogWriterConfig::default();
-		let log_writer_config =
-			if let Some(config) = &self.log_writer_config { config } else { &writer };
+		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
 		let logger = setup_logger(&log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
@@ -519,9 +515,7 @@ impl NodeBuilder {
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
-		let writer = LogWriterConfig::default();
-		let log_writer_config =
-			if let Some(config) = &self.log_writer_config { config } else { &writer };
+		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
 		let logger = setup_logger(&log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
@@ -651,8 +645,8 @@ impl ArcedNodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the `log` facade.
-	pub fn set_log_facade_logger(&self, lf_config: LogFacadeLoggerConfig) {
-		self.inner.write().unwrap().set_log_facade_logger(lf_config);
+	pub fn set_log_facade_logger(&self, log_level: LogLevel) {
+		self.inner.write().unwrap().set_log_facade_logger(log_level);
 	}
 
 	/// Configures the [`Node`] instance to write logs to the provided custom log writer.
@@ -1286,16 +1280,20 @@ fn build_with_store_internal(
 fn setup_logger(config: &LogWriterConfig) -> Result<Arc<Logger>, BuildError> {
 	match config {
 		LogWriterConfig::File(fs_logger_config) => {
-			let log_file_path = &fs_logger_config.log_file_path;
+			let log_file_path = if let Some(fp) = &fs_logger_config.log_file_path {
+				fp
+			} else {
+				&default_log_file_path()
+			};
+			let log_level = fs_logger_config.log_level.unwrap_or(default_log_level());
 
 			Ok(Arc::new(
-				Logger::new_fs_writer(log_file_path.to_string(), fs_logger_config.level)
+				Logger::new_fs_writer(log_file_path, log_level)
 					.map_err(|_| BuildError::LoggerSetupFailed)?,
 			))
 		},
-		LogWriterConfig::Log(log_facade_logger_config) => Ok(Arc::new(
-			Logger::new_log_facade(log_facade_logger_config.level)
-				.map_err(|_| BuildError::LoggerSetupFailed)?,
+		LogWriterConfig::Log(log_level) => Ok(Arc::new(
+			Logger::new_log_facade(*log_level).map_err(|_| BuildError::LoggerSetupFailed)?,
 		)),
 		LogWriterConfig::Custom(custom_log_writer) => Ok(Arc::new(
 			Logger::new_custom_writer(custom_log_writer.clone())
