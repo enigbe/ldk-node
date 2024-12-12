@@ -435,24 +435,29 @@ pub struct FilesystemLoggerConfig {
 	/// The log file path.
 	///
 	/// This specifies the log file path if a destination other than the storage
-	/// directory, i.e. [`Config::storage_dir_path`], is preferred.
-	pub log_file_path: String,
+	/// directory, i.e. [`Config::storage_dir_path`], is preferred. If unconfigured,
+	/// defaults to [`DEFAULT_STORAGE_DIR_PATH`]/[`DEFAULT_LOG_FILE_PATH`], i.e.
+	/// `/tmp/ldk_node/ldk_node.log`
+	pub log_file_path: Option<String>,
 	/// This specifies the log level.
-	pub level: LogLevel,
-}
-
-/// Configuration options for logging to the `log` facade.
-#[derive(Debug, Clone)]
-pub struct LogFacadeLoggerConfig {
-	/// This specifies the log level.
-	pub level: LogLevel,
+	///
+	/// If unconfigured, defaults to [`DEFAULT_LOG_LEVEL`], i.e. `LogLevel::Debug`
+	pub log_level: Option<LogLevel>,
 }
 
 impl Default for FilesystemLoggerConfig {
 	fn default() -> Self {
-		let log_file_path = format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILE_PATH);
-		Self { log_file_path, level: DEFAULT_LOG_LEVEL }
+		let log_file_path = default_log_file_path();
+		Self { log_file_path: Some(log_file_path), log_level: Some(default_log_level()) }
 	}
+}
+
+pub(crate) fn default_log_file_path() -> String {
+	format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILE_PATH)
+}
+
+pub(crate) fn default_log_level() -> LogLevel {
+	DEFAULT_LOG_LEVEL
 }
 
 #[cfg(test)]

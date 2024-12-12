@@ -85,7 +85,7 @@ pub mod graph;
 mod hex_utils;
 pub mod io;
 mod liquidity;
-mod logger;
+pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
@@ -111,8 +111,7 @@ pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
 
-pub use config::{FilesystemLoggerConfig, LogFacadeLoggerConfig};
-pub use logger::{LogLevel, LogRecord, LogWriter};
+pub use config::FilesystemLoggerConfig;
 
 #[cfg(feature = "uniffi")]
 use uniffi_types::*;
@@ -147,6 +146,7 @@ use types::{
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
 
 use logger::{log_error, log_info, log_trace, LdkLogger, Logger};
+pub use logger::{LogLevel, LogRecord, LogWriter};
 
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::Wallet as LdkWallet;
