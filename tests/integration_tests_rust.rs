@@ -16,9 +16,9 @@ use common::{
 };
 
 use ldk_node::config::{EsploraSyncConfig, FilesystemLoggerConfig};
+use ldk_node::logger::LogLevel;
 use ldk_node::payment::{PaymentKind, QrPaymentResult, SendingParameters};
-use ldk_node::LogLevel;
-use ldk_node::{Builder, Event, LogFacadeLoggerConfig, NodeError};
+use ldk_node::{Builder, Event, NodeError};
 
 use lightning::ln::channelmanager::PaymentId;
 use lightning::util::logger::Level;
@@ -226,8 +226,8 @@ fn start_stop_reinit() {
 	setup_builder!(builder, config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	builder.set_filesystem_logger(FilesystemLoggerConfig {
-		log_file_path: format!("{}/{}", config.storage_dir_path, "ldk_node.log"),
-		level: Level::Debug,
+		log_file_path: Some(format!("{}/{}", config.storage_dir_path, "ldk_node.log")),
+		log_level: Some(Level::Debug),
 	});
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -848,7 +848,7 @@ fn unified_qr_send_receive() {
 
 	// Setup `log` facade logger.
 	let mock_logger = init_log_logger(log::LevelFilter::Trace);
-	let log_writer = TestLogWriter::LogFacade(LogFacadeLoggerConfig { level: LogLevel::Trace });
+	let log_writer = TestLogWriter::LogFacade(LogLevel::Trace);
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false, log_writer);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
