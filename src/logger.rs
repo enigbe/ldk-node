@@ -15,14 +15,29 @@ pub use lightning::util::logger::Level as LogLevel;
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 
+#[cfg(not(feature = "uniffi"))]
+use core::fmt;
 use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-/// A unit of logging output with Metadata to enable filtering Module_path,
+/// A unit of logging output with Metadata to enable filtering module_path,
 /// file, line to inform on log's source.
+#[cfg(not(feature = "uniffi"))]
+pub struct LogRecord<'a> {
+	/// The verbosity level of the message.
+	pub level: LogLevel,
+	/// The message body.
+	pub args: fmt::Arguments<'a>,
+	/// The module path of the message.
+	pub module_path: &'a str,
+	/// The line containing the message.
+	pub line: u32,
+}
+
+#[cfg(feature = "uniffi")]
 pub struct LogRecord {
 	/// The verbosity level of the message.
 	pub level: LogLevel,
@@ -34,6 +49,7 @@ pub struct LogRecord {
 	pub line: u32,
 }
 
+#[cfg(feature = "uniffi")]
 impl<'a> From<Record<'a>> for LogRecord {
 	fn from(record: Record) -> Self {
 		Self {
@@ -45,8 +61,27 @@ impl<'a> From<Record<'a>> for LogRecord {
 	}
 }
 
+#[cfg(not(feature = "uniffi"))]
+impl<'a> From<Record<'a>> for LogRecord<'a> {
+	fn from(record: Record<'a>) -> Self {
+		Self {
+			level: record.level,
+			args: record.args,
+			module_path: record.module_path,
+			line: record.line,
+		}
+	}
+}
+
 /// LogWriter trait encapsulating the operations required of a
 /// logger's writer.
+#[cfg(not(feature = "uniffi"))]
+pub trait LogWriter: Send + Sync + Debug {
+	/// Log the record.
+	fn log<'a>(&self, record: LogRecord<'a>);
+}
+
+#[cfg(feature = "uniffi")]
 pub trait LogWriter: Send + Sync + Debug {
 	/// Log the record.
 	fn log(&self, record: LogRecord);
