@@ -6,6 +6,7 @@ package org.lightningdevkit.ldknode
 import kotlin.UInt
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue   
 import kotlin.io.path.createTempDirectory
 import org.junit.runner.RunWith
 import org.lightningdevkit.ldknode.*;
@@ -16,6 +17,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 @RunWith(AndroidJUnit4::class)
 class AndroidLibTest {
     @Test fun node_start_stop() {
+        val logWriter1 = CustomLogWriter(CustomLogWriter.LogLevel.GOSSIP)
+        val logWriter2 = CustomLogWriter(CustomLogWriter.LogLevel.GOSSIP)
+
         val tmpDir1 = createTempDirectory("ldk_node").toString()
         println("Random dir 1: $tmpDir1")
         val tmpDir2 = createTempDirectory("ldk_node").toString()
@@ -37,6 +41,9 @@ class AndroidLibTest {
         val builder1 = Builder.fromConfig(config1)
         val builder2 = Builder.fromConfig(config2)
 
+        builder1.set_custom_logger(logWriter1)
+        builder2.set_custom_logger(logWriter2)
+
         val node1 = builder1.build()
         val node2 = builder2.build()
 
@@ -55,7 +62,55 @@ class AndroidLibTest {
         val address2 = node2.onchain_payment().newOnchainAddress()
         println("Funding address 2: $address2")
 
+        assertTrue(logWriter1.getLogMessages().isNotEmpty())
+        assertTrue(logWriter2.getLogMessages().isNotEmpty())
+
         node1.stop()
         node2.stop()
+    }
+}
+
+class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO): LogWriter {
+    enum class LogLevel {
+        ERROR, WARN, INFO, DEBUG, TRACE, GOSSIP
+    }
+
+    private val logMessages = mutableListOf<String>()
+
+    fun setLogLevel(level: LogLevel) {
+        currentLogLevel = level
+    }
+
+    override fun log(record: LogRecord) {
+        val recordLevel = when(record.level.toLowerCase()) {
+            "error" -> LogLevel.ERROR
+            "warn" -> LogLevel.WARN
+            "info" -> LogLevel.INFO
+            "debug" -> LogLevel.DEBUG
+            "trace" -> LogLevel.TRACE
+            "gossip" -> LogLevel.GOSSIP
+            else -> LogLevel.INFO
+        }
+
+        if (isLevelEnabled(recordLevel)) {
+            val log_message = formatRecord(record)
+            logMessages.add(log_message)
+        }
+    }
+
+    private fun formatRecord(record: LogRecord): String {
+        val timestamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        return String.format(
+            "%s %-5s [%s:%d] %s\n",
+            timestamp,
+            record.level,
+            record.modulePath,
+            record.line,
+            record.message
+        )
+    }
+
+    private fun isLevelEnabled(level: LogLevel): Boolean {
+        return level.ordinal <= currentLogLevel.ordinal
     }
 }
