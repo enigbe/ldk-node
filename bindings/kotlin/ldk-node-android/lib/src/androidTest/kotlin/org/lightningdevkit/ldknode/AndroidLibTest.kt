@@ -6,16 +6,21 @@ package org.lightningdevkit.ldknode
 import kotlin.UInt
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue   
 import kotlin.io.path.createTempDirectory
 import org.junit.runner.RunWith
 import org.lightningdevkit.ldknode.*;
 import android.content.Context.MODE_PRIVATE
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.sun.jna.Pointer
 
 @RunWith(AndroidJUnit4::class)
 class AndroidLibTest {
     @Test fun node_start_stop() {
+        val logWriter1 = CustomLogWriter(CustomLogWriter.LogLevel.GOSSIP)
+        val logWriter2 = CustomLogWriter(CustomLogWriter.LogLevel.GOSSIP)
+
         val tmpDir1 = createTempDirectory("ldk_node").toString()
         println("Random dir 1: $tmpDir1")
         val tmpDir2 = createTempDirectory("ldk_node").toString()
@@ -28,16 +33,17 @@ class AndroidLibTest {
         config1.storageDirPath = tmpDir1
         config1.listeningAddresses = listOf(listenAddress1)
         config1.network = Network.REGTEST
-        config1.logLevel = LogLevel.TRACE
 
         val config2 = defaultConfig()
         config2.storageDirPath = tmpDir2
         config2.listeningAddresses = listOf(listenAddress2)
         config2.network = Network.REGTEST
-        config2.logLevel = LogLevel.TRACE
 
         val builder1 = Builder.fromConfig(config1)
         val builder2 = Builder.fromConfig(config2)
+
+        builder1.setCustomLogger(logWriter1)
+        builder2.setCustomLogger(logWriter2)
 
         val node1 = builder1.build()
         val node2 = builder2.build()
@@ -51,13 +57,65 @@ class AndroidLibTest {
         val nodeId2 = node2.nodeId()
         println("Node Id 2: $nodeId2")
 
-        val address1 = node1.onchain_payment().newOnchainAddress()
+        val address1 = node1.onchainPayment().newAddress()
         println("Funding address 1: $address1")
 
-        val address2 = node2.onchain_payment().newOnchainAddress()
+        val address2 = node2.onchainPayment().newAddress()
         println("Funding address 2: $address2")
+
+        assertTrue(logWriter1.getLogMessages().isNotEmpty())
+        assertTrue(logWriter2.getLogMessages().isNotEmpty())
 
         node1.stop()
         node2.stop()
+    }
+}
+
+class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO): LogWriter(Pointer.NULL) {
+    enum class LogLevel {
+        ERROR, WARN, INFO, DEBUG, TRACE, GOSSIP
+    }
+
+    private val logMessages = mutableListOf<String>()
+
+    fun setLogLevel(level: LogLevel) {
+        currentLogLevel = level
+    }
+
+    fun getLogMessages(): List<String> {
+        return logMessages.toList()
+    }
+
+    override fun log(record: LogRecord) {
+        val recordLevel = when(record.level.toString().lowercase()) {
+            "error" -> LogLevel.ERROR
+            "warn" -> LogLevel.WARN
+            "info" -> LogLevel.INFO
+            "debug" -> LogLevel.DEBUG
+            "trace" -> LogLevel.TRACE
+            "gossip" -> LogLevel.GOSSIP
+            else -> LogLevel.INFO
+        }
+
+        if (isLevelEnabled(recordLevel)) {
+            val logMessage = formatRecord(record)
+            logMessages.add(logMessage)
+        }
+    }
+
+    private fun formatRecord(record: LogRecord): String {
+        val timestamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        return String.format(
+            "%s %-5s [%s:%d] %s\n",
+            timestamp,
+            record.level,
+            record.modulePath,
+            record.line,
+            record.args
+        )
+    }
+
+    private fun isLevelEnabled(level: LogLevel): Boolean {
+        return level.ordinal <= currentLogLevel.ordinal
     }
 }
