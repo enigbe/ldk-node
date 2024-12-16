@@ -73,14 +73,22 @@ impl<'a> From<Record<'a>> for LogRecord<'a> {
 	}
 }
 
-/// LogWriter trait encapsulating the operations required of a
-/// logger's writer.
+/// Defines the behavior required for writing log records.
+///
+/// Implementors of this trait are responsible for handling log messages,
+/// which may involve formatting, filtering, and forwarding them to specific
+/// outputs.
 #[cfg(not(feature = "uniffi"))]
 pub trait LogWriter: Send + Sync + Debug {
 	/// Log the record.
 	fn log<'a>(&self, record: LogRecord<'a>);
 }
 
+/// Defines the behavior required for writing log records.
+///
+/// This version is used when the `uniffi` feature is enabled.
+/// It is similar to the non-`uniffi` version, but it omits the lifetime parameter
+/// for the `LogRecord`, as the Uniffi-exposed interface cannot handle lifetimes.
 #[cfg(feature = "uniffi")]
 pub trait LogWriter: Send + Sync + Debug {
 	/// Log the record.
