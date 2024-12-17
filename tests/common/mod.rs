@@ -8,11 +8,13 @@
 #![cfg(any(test, cln_test, vss_test))]
 #![allow(dead_code)]
 
+use chrono::Utc;
 use ldk_node::config::{Config, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
+use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
-	Builder, CustomTlvRecord, Event, LightningBalance, LogLevel, Node, NodeError,
+	Builder, CustomTlvRecord, Event, FilesystemLoggerConfig, LightningBalance, Node, NodeError,
 	PendingSweepBalance,
 };
 
@@ -37,9 +39,11 @@ use electrum_client::ElectrumApi;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
+use log::{LevelFilter, Log};
+
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 macro_rules! expect_event {
@@ -234,8 +238,6 @@ pub(crate) fn random_config(anchor_channels: bool) -> Config {
 	println!("Setting random LDK node alias: {:?}", alias);
 	config.node_alias = alias;
 
-	config.log_level = LogLevel::Gossip;
-
 	config
 }
 
@@ -248,6 +250,70 @@ type TestNode = Node;
 pub(crate) enum TestChainSource<'a> {
 	Esplora(&'a ElectrsD),
 	BitcoindRpc(&'a BitcoinD),
+}
+
+#[derive(Clone)]
+pub(crate) enum TestLogWriter {
+	File(FilesystemLoggerConfig),
+	LogFacade(LogLevel),
+	Custom(Arc<dyn LogWriter + Send + Sync>),
+}
+
+/// Simple in-memory mock `log` logger for tests.
+pub(crate) struct MockLogger {
+	logs: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockLogger {
+	pub fn new() -> Self {
+		Self { logs: Arc::new(Mutex::new(Vec::new())) }
+	}
+
+	pub fn retrieve_logs(&self) -> Vec<String> {
+		self.logs.lock().unwrap().clone()
+	}
+}
+
+impl Log for MockLogger {
+	fn log(&self, record: &log::Record) {
+		let message = format!(
+			"{} [{}] {}",
+			Utc::now().format("%Y-%m-%d %H:%M:%S"),
+			record.level(),
+			record.args()
+		);
+		self.logs.lock().unwrap().push(message);
+	}
+
+	fn enabled(&self, _metadata: &log::Metadata) -> bool {
+		true
+	}
+
+	fn flush(&self) {}
+}
+
+impl LogWriter for MockLogger {
+	fn log(&self, record: LogRecord) {
+		let message = format!(
+			"{} [{}] {}",
+			Utc::now().format("%Y-%m-%d %H:%M:%S"),
+			record.level,
+			record.args
+		);
+		self.logs.lock().unwrap().push(message);
+	}
+}
+
+pub(crate) fn init_log_logger(level: LevelFilter) -> Arc<MockLogger> {
+	let logger = Arc::new(MockLogger::new());
+	log::set_boxed_logger(Box::new(logger.clone())).unwrap();
+	log::set_max_level(level);
+	logger
+}
+
+pub(crate) fn init_custom_logger() -> Arc<MockLogger> {
+	let logger = Arc::new(MockLogger::new());
+	logger
 }
 
 macro_rules! setup_builder {
