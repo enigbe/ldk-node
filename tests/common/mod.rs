@@ -276,10 +276,6 @@ impl MockLogger {
 	}
 }
 
-/// [`MockLogger`] as `log` logger - destination for [`Writer::LogFacadeWriter`]
-/// to write logs to.
-///
-/// [`Writer::LogFacadeWriter`]: ldk_node::logger::Writer::LogFacadeWriter
 impl Log for MockLogger {
 	fn log(&self, record: &log::Record) {
 		let message = format!(
@@ -335,11 +331,11 @@ pub(crate) use setup_builder;
 
 pub(crate) fn setup_two_nodes(
 	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
-	anchors_trusted_no_reserve: bool, log_writer: TestLogWriter,
+	anchors_trusted_no_reserve: bool,
 ) -> (TestNode, TestNode) {
 	println!("== Node A ==");
 	let config_a = random_config(anchor_channels);
-	let node_a = setup_node(chain_source, config_a, None, log_writer.clone());
+	let node_a = setup_node(chain_source, config_a, None);
 
 	println!("\n== Node B ==");
 	let mut config_b = random_config(anchor_channels);
@@ -354,13 +350,12 @@ pub(crate) fn setup_two_nodes(
 			.trusted_peers_no_reserve
 			.push(node_a.node_id());
 	}
-	let node_b = setup_node(chain_source, config_b, None, log_writer);
+	let node_b = setup_node(chain_source, config_b, None);
 	(node_a, node_b)
 }
 
 pub(crate) fn setup_node(
 	chain_source: &TestChainSource, config: Config, seed_bytes: Option<Vec<u8>>,
-	log_writer: TestLogWriter,
 ) -> TestNode {
 	setup_builder!(builder, config);
 	match chain_source {
@@ -378,18 +373,6 @@ pub(crate) fn setup_node(
 			let rpc_user = values.user;
 			let rpc_password = values.password;
 			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
-		},
-	}
-
-	match log_writer {
-		TestLogWriter::File(fs_config) => {
-			builder.set_filesystem_logger(fs_config);
-		},
-		TestLogWriter::LogFacade(log_level) => {
-			builder.set_log_facade_logger(log_level);
-		},
-		TestLogWriter::Custom(log_writer) => {
-			builder.set_custom_logger(log_writer);
 		},
 	}
 
