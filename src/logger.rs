@@ -17,7 +17,6 @@ use log::{debug, error, info, trace, warn};
 
 #[cfg(not(feature = "uniffi"))]
 use core::fmt;
-use std::fmt::Debug;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -79,7 +78,7 @@ impl<'a> From<Record<'a>> for LogRecord<'a> {
 /// which may involve formatting, filtering, and forwarding them to specific
 /// outputs.
 #[cfg(not(feature = "uniffi"))]
-pub trait LogWriter: Send + Sync + Debug {
+pub trait LogWriter: Send + Sync {
 	/// Log the record.
 	fn log<'a>(&self, record: LogRecord<'a>);
 }
@@ -90,13 +89,12 @@ pub trait LogWriter: Send + Sync + Debug {
 /// It is similar to the non-`uniffi` version, but it omits the lifetime parameter
 /// for the `LogRecord`, as the Uniffi-exposed interface cannot handle lifetimes.
 #[cfg(feature = "uniffi")]
-pub trait LogWriter: Send + Sync + Debug {
+pub trait LogWriter: Send + Sync {
 	/// Log the record.
 	fn log(&self, record: LogRecord);
 }
 
 /// Defines a writer for [`Logger`].
-#[derive(Debug)]
 pub(crate) enum Writer {
 	/// Writes logs to the file system.
 	FileWriter { file_path: String, level: LogLevel },

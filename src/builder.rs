@@ -109,11 +109,23 @@ impl Default for LiquiditySourceConfig {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum LogWriterConfig {
 	File(FilesystemLoggerConfig),
 	Log(LogLevel),
 	Custom(Arc<dyn LogWriter + Send + Sync>),
+}
+
+impl std::fmt::Debug for LogWriterConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			LogWriterConfig::File(config) => f.debug_tuple("File").field(config).finish(),
+			LogWriterConfig::Log(level) => f.debug_tuple("Log").field(level).finish(),
+			LogWriterConfig::Custom(_) => {
+				f.debug_tuple("Custom").field(&"<config internal to custom log writer>").finish()
+			},
+		}
+	}
 }
 
 impl Default for LogWriterConfig {
