@@ -263,7 +263,6 @@ pub(crate) enum TestLogWriter {
 }
 
 /// Simple in-memory mock `log` logger for tests.
-#[derive(Debug)]
 pub(crate) struct MockLogger {
 	logs: Arc<Mutex<Vec<String>>>,
 }
@@ -300,10 +299,6 @@ impl Log for MockLogger {
 	fn flush(&self) {}
 }
 
-/// [`MockLogger`] as custom logger - a destination for [`Writer::CustomWriter`]
-/// to write logs to.
-///
-/// [`Writer::CustomWriter`]: ldk_node::logger::Writer::CustomWriter
 impl LogWriter for MockLogger {
 	fn log(&self, record: LogRecord) {
 		let message = format!(
