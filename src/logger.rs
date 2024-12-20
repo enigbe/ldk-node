@@ -124,7 +124,7 @@ impl LogWriter for Writer {
 				fs::OpenOptions::new()
 					.create(true)
 					.append(true)
-					.open(file_path.clone())
+					.open(file_path)
 					.expect("Failed to open log file")
 					.write_all(log.as_bytes())
 					.expect("Failed to write to log file")
