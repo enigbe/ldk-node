@@ -10,9 +10,10 @@
 
 use ldk_node::config::{Config, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
+use ldk_node::logger::LogLevel;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
-	Builder, CustomTlvRecord, Event, LightningBalance, LogLevel, Node, NodeError,
+	Builder, CustomTlvRecord, Event, FilesystemLoggerConfig, LightningBalance, Node, NodeError,
 	PendingSweepBalance,
 };
 
@@ -234,8 +235,6 @@ pub(crate) fn random_config(anchor_channels: bool) -> Config {
 	println!("Setting random LDK node alias: {:?}", alias);
 	config.node_alias = alias;
 
-	config.log_level = LogLevel::Gossip;
-
 	config
 }
 
@@ -307,6 +306,10 @@ pub(crate) fn setup_node(
 			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
 		},
 	}
+
+	let mut fs_config = FilesystemLoggerConfig::default();
+	fs_config.log_level = Some(LogLevel::Gossip);
+	builder.set_filesystem_logger(fs_config);
 
 	if let Some(seed) = seed_bytes {
 		builder.set_entropy_seed_bytes(seed).unwrap();

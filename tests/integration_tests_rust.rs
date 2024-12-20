@@ -14,11 +14,12 @@ use common::{
 	setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
 };
 
-use ldk_node::config::EsploraSyncConfig;
+use ldk_node::config::{EsploraSyncConfig, FilesystemLoggerConfig};
 use ldk_node::payment::{PaymentKind, QrPaymentResult, SendingParameters};
 use ldk_node::{Builder, Event, NodeError};
 
 use lightning::ln::channelmanager::PaymentId;
+use lightning::util::logger::Level;
 use lightning::util::persist::KVStore;
 
 use bitcoincore_rpc::RpcApi;
@@ -215,6 +216,10 @@ fn start_stop_reinit() {
 	sync_config.lightning_wallet_sync_interval_secs = 100000;
 	setup_builder!(builder, config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	builder.set_filesystem_logger(FilesystemLoggerConfig {
+		log_file_path: Some(format!("{}/{}", config.storage_dir_path, "ldk_node.log")),
+		log_level: Some(Level::Debug),
+	});
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
 	node.start().unwrap();
@@ -773,6 +778,7 @@ fn simple_bolt12_send_receive() {
 fn generate_bip21_uri() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
+
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
@@ -815,6 +821,7 @@ fn generate_bip21_uri() {
 fn unified_qr_send_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
+
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
