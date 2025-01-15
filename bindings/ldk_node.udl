@@ -39,6 +39,18 @@ dictionary FilesystemLoggerConfig {
 	LogLevel? log_level;
 };
 
+dictionary LogRecord {
+	LogLevel level;
+	string args;
+	string module_path;
+	u32 line;
+};
+
+[Trait]
+interface LogWriter {
+    void log(LogRecord record);
+};
+
 interface Builder {
 	constructor();
 	[Name=from_config]
@@ -569,18 +581,6 @@ dictionary NodeAnnouncementInfo {
 	u32 last_update;
 	string alias;
 	sequence<SocketAddress> addresses;
-};
-
-dictionary LogRecord {
-	LogLevel level;
-	string args;
-	string module_path;
-	u32 line;
-};
-
-[Trait]
-interface LogWriter {
-    void log(LogRecord record);
 };
 
 [Custom]
