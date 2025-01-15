@@ -428,8 +428,7 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		use bitcoin::key::Secp256k1;
 
-		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
-		let logger = setup_logger(&log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -494,8 +493,7 @@ impl NodeBuilder {
 	pub fn build_with_vss_store_and_header_provider(
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
-		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
-		let logger = setup_logger(&log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -527,8 +525,7 @@ impl NodeBuilder {
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
-		let log_writer_config = self.log_writer_config.clone().unwrap_or_default();
-		let logger = setup_logger(&log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -1289,7 +1286,9 @@ fn build_with_store_internal(
 }
 
 /// Sets up the node logger.
-fn setup_logger(config: &LogWriterConfig) -> Result<Arc<Logger>, BuildError> {
+fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, BuildError> {
+	let config = if let Some(conf) = config_opt { conf } else { &LogWriterConfig::default() };
+
 	match config {
 		LogWriterConfig::File(fs_logger_config) => {
 			let log_file_path = if let Some(fp) = &fs_logger_config.log_file_path {
