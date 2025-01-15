@@ -1289,7 +1289,7 @@ fn build_with_store_internal(
 fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, BuildError> {
 	let config = if let Some(conf) = config_opt { conf } else { &LogWriterConfig::default() };
 
-	match config {
+	let logger = match config {
 		LogWriterConfig::File(fs_logger_config) => {
 			let log_file_path = if let Some(fp) = &fs_logger_config.log_file_path {
 				fp
@@ -1298,19 +1298,20 @@ fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, Bui
 			};
 			let log_level = fs_logger_config.log_level.unwrap_or(DEFAULT_LOG_LEVEL);
 
-			Ok(Arc::new(
-				Logger::new_fs_writer(log_file_path, log_level)
-					.map_err(|_| BuildError::LoggerSetupFailed)?,
-			))
+			Logger::new_fs_writer(log_file_path, log_level)
+				.map_err(|_| BuildError::LoggerSetupFailed)?
 		},
-		LogWriterConfig::Log(log_level) => Ok(Arc::new(
-			Logger::new_log_facade(*log_level).map_err(|_| BuildError::LoggerSetupFailed)?,
-		)),
-		LogWriterConfig::Custom(custom_log_writer) => Ok(Arc::new(
-			Logger::new_custom_writer(custom_log_writer.clone())
-				.map_err(|_| BuildError::LoggerSetupFailed)?,
-		)),
-	}
+		LogWriterConfig::Log(log_level) => {
+			Logger::new_log_facade(*log_level).map_err(|_| BuildError::LoggerSetupFailed)?
+		},
+
+		LogWriterConfig::Custom(custom_log_writer) => {
+			Logger::new_custom_writer(Arc::clone(custom_log_writer))
+				.map_err(|_| BuildError::LoggerSetupFailed)?
+		},
+	};
+
+	Ok(Arc::new(logger))
 }
 
 fn seed_bytes_from_config(
