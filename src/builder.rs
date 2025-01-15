@@ -7,8 +7,8 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_log_file_path, default_log_level, default_user_config, Config, EsploraSyncConfig,
-	FilesystemLoggerConfig, WALLET_KEYS_SEED_LEN,
+	default_user_config, Config, EsploraSyncConfig, FilesystemLoggerConfig, DEFAULT_LOG_FILE_PATH,
+	DEFAULT_LOG_LEVEL, WALLET_KEYS_SEED_LEN,
 };
 
 use crate::connection::ConnectionManager;
@@ -1295,9 +1295,9 @@ fn setup_logger(config: &LogWriterConfig) -> Result<Arc<Logger>, BuildError> {
 			let log_file_path = if let Some(fp) = &fs_logger_config.log_file_path {
 				fp
 			} else {
-				&default_log_file_path()
+				DEFAULT_LOG_FILE_PATH
 			};
-			let log_level = fs_logger_config.log_level.unwrap_or(default_log_level());
+			let log_level = fs_logger_config.log_level.unwrap_or(DEFAULT_LOG_LEVEL);
 
 			Ok(Arc::new(
 				Logger::new_fs_writer(log_file_path, log_level)
