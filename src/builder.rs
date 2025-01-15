@@ -335,7 +335,7 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to write logs to the `log` facade.
+	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
 	pub fn set_log_facade_logger(&mut self, log_level: LogLevel) -> &mut Self {
 		self.log_writer_config = Some(LogWriterConfig::Log(log_level));
 		self
