@@ -329,9 +329,13 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to write logs to the filesystem.
-	pub fn set_filesystem_logger(&mut self, fs_config: FilesystemLoggerConfig) -> &mut Self {
-		self.log_writer_config = Some(LogWriterConfig::File(fs_config));
+	/// Configures the [`Node`] instance to write logs to the filesystem with an optional
+	/// `file_path` and `log_level` arguments.
+	pub fn set_filesystem_logger(
+		&mut self, log_file_path: Option<String>, log_level: Option<LogLevel>,
+	) -> &mut Self {
+		self.log_writer_config =
+			Some(LogWriterConfig::File(FilesystemLoggerConfig { log_file_path, log_level }));
 		self
 	}
 
@@ -648,9 +652,12 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_storage_dir_path(storage_dir_path);
 	}
 
-	/// Configures the [`Node`] instance to write logs to the filesystem.
-	pub fn set_filesystem_logger(&self, fs_config: FilesystemLoggerConfig) {
-		self.inner.write().unwrap().set_filesystem_logger(fs_config);
+	/// Configures the [`Node`] instance to write logs to the filesystem with an optional
+	/// `file_path` and `log_level` arguments.
+	pub fn set_filesystem_logger(
+		&self, log_file_path: Option<String>, log_level: Option<LogLevel>,
+	) {
+		self.inner.write().unwrap().set_filesystem_logger(log_file_path, log_level);
 	}
 
 	/// Configures the [`Node`] instance to write logs to the `log` facade.
