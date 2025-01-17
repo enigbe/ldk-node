@@ -444,7 +444,7 @@ pub struct FilesystemLoggerConfig {
 	pub log_file_path: Option<String>,
 	/// This specifies the log level.
 	///
-	/// If unconfigured, defaults to [`DEFAULT_LOG_LEVEL`], i.e. `LogLevel::Debug`
+	/// If unconfigured, defaults to `Debug`.
 	pub log_level: Option<LogLevel>,
 }
 
