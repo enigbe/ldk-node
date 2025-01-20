@@ -181,12 +181,12 @@ impl Logger {
 		Ok(Self { writer: Writer::FileWriter { file_path: file_path.to_string(), level } })
 	}
 
-	pub fn new_log_facade(level: LogLevel) -> Result<Self, ()> {
-		Ok(Self { writer: Writer::LogFacadeWriter { level } })
+	pub fn new_log_facade(level: LogLevel) -> Self {
+		Self { writer: Writer::LogFacadeWriter { level } }
 	}
 
-	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter + Send + Sync>) -> Result<Self, ()> {
-		Ok(Self { writer: Writer::CustomWriter(log_writer) })
+	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter + Send + Sync>) -> Self {
+		Self { writer: Writer::CustomWriter(log_writer) }
 	}
 }
 

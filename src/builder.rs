@@ -1308,13 +1308,10 @@ fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, Bui
 			Logger::new_fs_writer(log_file_path, log_level)
 				.map_err(|_| BuildError::LoggerSetupFailed)?
 		},
-		LogWriterConfig::Log(log_level) => {
-			Logger::new_log_facade(*log_level).map_err(|_| BuildError::LoggerSetupFailed)?
-		},
+		LogWriterConfig::Log(log_level) => Logger::new_log_facade(*log_level),
 
 		LogWriterConfig::Custom(custom_log_writer) => {
 			Logger::new_custom_writer(Arc::clone(custom_log_writer))
-				.map_err(|_| BuildError::LoggerSetupFailed)?
 		},
 	};
 
