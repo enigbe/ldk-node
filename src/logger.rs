@@ -106,20 +106,20 @@ pub(crate) enum Writer {
 
 impl LogWriter for Writer {
 	fn log(&self, record: LogRecord) {
-		let log = format!(
-			"{} {:<5} [{}:{}] {}\n",
-			Utc::now().format("%Y-%m-%d %H:%M:%S"),
-			record.level.to_string(),
-			record.module_path,
-			record.line,
-			record.args
-		);
-
 		match self {
 			Writer::FileWriter { file_path, level } => {
 				if record.level < *level {
 					return;
 				}
+
+				let log = format!(
+					"{} {:<5} [{}:{}] {}\n",
+					Utc::now().format("%Y-%m-%d %H:%M:%S"),
+					record.level.to_string(),
+					record.module_path,
+					record.line,
+					record.args
+				);
 
 				fs::OpenOptions::new()
 					.create(true)
@@ -129,13 +129,28 @@ impl LogWriter for Writer {
 					.write_all(log.as_bytes())
 					.expect("Failed to write to log file")
 			},
-			Writer::LogFacadeWriter { level } => match level {
-				LogLevel::Gossip => trace!("{}", log),
-				LogLevel::Trace => trace!("{}", log),
-				LogLevel::Debug => debug!("{}", log),
-				LogLevel::Info => info!("{}", log),
-				LogLevel::Warn => warn!("{}", log),
-				LogLevel::Error => error!("{}", log),
+			Writer::LogFacadeWriter { level } => {
+				macro_rules! log_with_level {
+					($log_level:expr, $($args:tt)*) => {
+						match $log_level {
+							LogLevel::Gossip | LogLevel::Trace => trace!($($args)*),
+            				LogLevel::Debug => debug!($($args)*),
+            				LogLevel::Info => info!($($args)*),
+            				LogLevel::Warn => warn!($($args)*),
+            				LogLevel::Error => error!($($args)*),
+						}
+					};
+				}
+
+				log_with_level!(
+					level,
+					"{} {:<5} [{}:{}] {}",
+					Utc::now().format("%Y-%m-%d %H:%M:%S"),
+					record.level,
+					record.module_path,
+					record.line,
+					record.args
+				)
 			},
 			Writer::CustomWriter(custom_logger) => custom_logger.log(record),
 		}
