@@ -113,7 +113,7 @@ impl Default for LiquiditySourceConfig {
 enum LogWriterConfig {
 	File(FilesystemLoggerConfig),
 	Log(LogLevel),
-	Custom(Arc<dyn LogWriter + Send + Sync>),
+	Custom(Arc<dyn LogWriter>),
 }
 
 impl std::fmt::Debug for LogWriterConfig {
