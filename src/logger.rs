@@ -185,7 +185,7 @@ impl Logger {
 		Self { writer: Writer::LogFacadeWriter { level } }
 	}
 
-	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter + Send + Sync>) -> Self {
+	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter>) -> Self {
 		Self { writer: Writer::CustomWriter(log_writer) }
 	}
 }
