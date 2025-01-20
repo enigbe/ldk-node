@@ -101,7 +101,7 @@ pub(crate) enum Writer {
 	/// Forwards logs to the `log` facade.
 	LogFacadeWriter { level: LogLevel },
 	/// Forwards logs to a custom writer.
-	CustomWriter(Arc<dyn LogWriter + Send + Sync>),
+	CustomWriter(Arc<dyn LogWriter>),
 }
 
 impl LogWriter for Writer {

@@ -346,7 +346,7 @@ impl NodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the provided custom log writer.
-	pub fn set_custom_logger(&mut self, log_writer: Arc<dyn LogWriter + Send + Sync>) -> &mut Self {
+	pub fn set_custom_logger(&mut self, log_writer: Arc<dyn LogWriter>) -> &mut Self {
 		self.log_writer_config = Some(LogWriterConfig::Custom(log_writer));
 		self
 	}
@@ -666,7 +666,7 @@ impl ArcedNodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the provided custom log writer.
-	pub fn set_custom_logger(&self, log_writer: Arc<dyn LogWriter + Send + Sync>) {
+	pub fn set_custom_logger(&self, log_writer: Arc<dyn LogWriter>) {
 		self.inner.write().unwrap().set_custom_logger(log_writer);
 	}
 
