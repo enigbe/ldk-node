@@ -7,7 +7,7 @@
 
 //! Logging-related objects.
 
-pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record};
+pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
 pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
 
 pub use lightning::util::logger::Level as LogLevel;
@@ -49,8 +49,8 @@ pub struct LogRecord {
 }
 
 #[cfg(feature = "uniffi")]
-impl<'a> From<Record<'a>> for LogRecord {
-	fn from(record: Record) -> Self {
+impl<'a> From<LdkRecord<'a>> for LogRecord {
+	fn from(record: LdkRecord) -> Self {
 		Self {
 			level: record.level,
 			args: record.args.to_string(),
@@ -61,8 +61,8 @@ impl<'a> From<Record<'a>> for LogRecord {
 }
 
 #[cfg(not(feature = "uniffi"))]
-impl<'a> From<Record<'a>> for LogRecord<'a> {
-	fn from(record: Record<'a>) -> Self {
+impl<'a> From<LdkRecord<'a>> for LogRecord<'a> {
+	fn from(record: LdkRecord<'a>) -> Self {
 		Self {
 			level: record.level,
 			args: record.args,
@@ -191,7 +191,7 @@ impl Logger {
 }
 
 impl LdkLogger for Logger {
-	fn log(&self, record: Record) {
+	fn log(&self, record: LdkRecord) {
 		match &self.writer {
 			Writer::FileWriter { file_path: _, level } => {
 				if record.level < *level {
