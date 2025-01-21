@@ -1294,7 +1294,8 @@ fn build_with_store_internal(
 
 /// Sets up the node logger.
 fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, BuildError> {
-	let config = if let Some(conf) = config_opt { conf } else { &LogWriterConfig::default() };
+	let default_config = LogWriterConfig::default();
+	let config = if let Some(conf) = config_opt { conf } else { &default_config };
 
 	let logger = match config {
 		LogWriterConfig::File(fs_logger_config) => {
@@ -1311,7 +1312,7 @@ fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, Bui
 		LogWriterConfig::Log(log_level) => Logger::new_log_facade(*log_level),
 
 		LogWriterConfig::Custom(custom_log_writer) => {
-			Logger::new_custom_writer(Arc::clone(custom_log_writer))
+			Logger::new_custom_writer(Arc::clone(&custom_log_writer))
 		},
 	};
 
