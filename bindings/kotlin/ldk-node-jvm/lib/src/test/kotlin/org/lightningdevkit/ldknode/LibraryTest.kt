@@ -93,8 +93,8 @@ fun waitForBlock(esploraEndpoint: String, blockHash: String) {
     }
 }
 
-class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO, noPointer: NoPointer = NoPointer) :
-    LogWriter(noPointer) {
+class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO) :
+    LogWriter {
     enum class LogLevel {
         ERROR, WARN, INFO, DEBUG, TRACE, GOSSIP
     }
