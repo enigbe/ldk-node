@@ -41,7 +41,7 @@ dictionary LogRecord {
 	u32 line;
 };
 
-[Trait]
+[Trait, WithForeign]
 interface LogWriter {
     void log(LogRecord record);
 };
