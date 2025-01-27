@@ -132,7 +132,7 @@ class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO) :
             java.time.LocalDateTime.now()
                 .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
         return String.format(
-            "%s %-5s [%s:%d] %s\n",
+            "%s %-6s [%s:%s] %s\n",
             timestamp,
             record.level,
             record.modulePath,
