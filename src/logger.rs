@@ -22,8 +22,8 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-/// A unit of logging output with Metadata to enable filtering module_path,
-/// file, line to inform on log's source.
+/// A unit of logging output with metadata to enable filtering `module_path`,
+/// `file`, and `line` to inform on log's source.
 #[cfg(not(feature = "uniffi"))]
 pub struct LogRecord<'a> {
 	/// The verbosity level of the message.
@@ -36,6 +36,12 @@ pub struct LogRecord<'a> {
 	pub line: u32,
 }
 
+/// A unit of logging output with metadata to enable filtering `module_path`,
+/// `file`, and `line` to inform on log's source.
+///
+/// This version is used when the `uniffi` feature is enabled.
+/// It is similar to the non-`uniffi` version, but it omits the lifetime parameter
+/// for the `LogRecord`, as the Uniffi-exposed interface cannot handle lifetimes.
 #[cfg(feature = "uniffi")]
 pub struct LogRecord {
 	/// The verbosity level of the message.
@@ -85,6 +91,9 @@ pub trait LogWriter: Send + Sync {
 
 /// Defines the behavior required for writing log records.
 ///
+/// Implementors of this trait are responsible for handling log messages,
+/// which may involve formatting, filtering, and forwarding them to specific
+/// outputs.
 /// This version is used when the `uniffi` feature is enabled.
 /// It is similar to the non-`uniffi` version, but it omits the lifetime parameter
 /// for the `LogRecord`, as the Uniffi-exposed interface cannot handle lifetimes.

@@ -348,7 +348,7 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to write logs to the provided custom log writer.
+	/// Configures the [`Node`] instance to write logs to the provided custom [`LogWriter`].
 	pub fn set_custom_logger(&mut self, log_writer: Arc<dyn LogWriter>) -> &mut Self {
 		self.log_writer_config = Some(LogWriterConfig::Custom(log_writer));
 		self
@@ -655,20 +655,23 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_storage_dir_path(storage_dir_path);
 	}
 
-	/// Configures the [`Node`] instance to write logs to the filesystem with an optional
-	/// `file_path` and `log_level` arguments.
+	/// Configures the [`Node`] instance to write logs to the filesystem.
+	///
+	/// The `log_file_path` defaults to the [`DEFAULT_LOG_FILENAME`] in the default
+	/// storage directory if set to None.
+	/// The `log_level` defaults to [`DEFAULT_LOG_LEVEL`] if set to None.
 	pub fn set_filesystem_logger(
 		&self, log_file_path: Option<String>, log_level: Option<LogLevel>,
 	) {
 		self.inner.write().unwrap().set_filesystem_logger(log_file_path, log_level);
 	}
 
-	/// Configures the [`Node`] instance to write logs to the `log` facade.
+	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
 	pub fn set_log_facade_logger(&self, log_level: LogLevel) {
 		self.inner.write().unwrap().set_log_facade_logger(log_level);
 	}
 
-	/// Configures the [`Node`] instance to write logs to the provided custom log writer.
+	/// Configures the [`Node`] instance to write logs to the provided custom [`LogWriter`].
 	pub fn set_custom_logger(&self, log_writer: Arc<dyn LogWriter>) {
 		self.inner.write().unwrap().set_custom_logger(log_writer);
 	}
@@ -1298,7 +1301,7 @@ fn build_with_store_internal(
 /// Sets up the node logger.
 ///
 /// If `log_writer_conf` is set to None, uses [`LogWriterConfig::default()`].
-/// The `node_conf`is provided to access the configured storage directory.
+/// The `node_conf` is provided to access the configured storage directory.
 fn setup_logger(
 	log_writer_conf: &Option<LogWriterConfig>, node_conf: &Config,
 ) -> Result<Arc<Logger>, BuildError> {
