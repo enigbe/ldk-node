@@ -22,7 +22,6 @@ use bitcoin::Network;
 use std::time::Duration;
 
 // Config defaults
-const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
 const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
@@ -33,8 +32,11 @@ const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 /// The default log level.
 pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
 
-/// The default log filename.
-pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
+/// The default log file path.
+pub const DEFAULT_LOG_FILE_PATH: &'static str = "/tmp/ldk_node/ldk_node.log";
+
+/// The default storage directory.
+pub const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
@@ -429,30 +431,6 @@ impl From<MaxDustHTLCExposure> for LdkMaxDustHTLCExposure {
 			MaxDustHTLCExposure::FeeRateMultiplier { multiplier } => {
 				Self::FeeRateMultiplier(multiplier)
 			},
-		}
-	}
-}
-
-/// Configuration options for logging to the filesystem.
-#[derive(Debug, Clone)]
-pub struct FilesystemLoggerConfig {
-	/// The log file path.
-	///
-	/// This specifies the log file path if a destination other than the storage
-	/// directory, i.e. [`Config::storage_dir_path`], is preferred. If unconfigured,
-	/// defaults to [`DEFAULT_LOG_FILENAME`] in default storage directory.
-	pub log_file_path: Option<String>,
-	/// This specifies the log level.
-	///
-	/// If unconfigured, defaults to `Debug`.
-	pub log_level: Option<LogLevel>,
-}
-
-impl Default for FilesystemLoggerConfig {
-	fn default() -> Self {
-		Self {
-			log_file_path: Some(format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME)),
-			log_level: Some(DEFAULT_LOG_LEVEL),
 		}
 	}
 }

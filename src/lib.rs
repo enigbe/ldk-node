@@ -111,8 +111,6 @@ pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
 
-pub use config::FilesystemLoggerConfig;
-
 #[cfg(feature = "uniffi")]
 use uniffi_types::*;
 

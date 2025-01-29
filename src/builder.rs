@@ -7,8 +7,8 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_user_config, Config, EsploraSyncConfig, FilesystemLoggerConfig, DEFAULT_LOG_FILENAME,
-	DEFAULT_LOG_LEVEL, WALLET_KEYS_SEED_LEN,
+	default_user_config, Config, EsploraSyncConfig, DEFAULT_LOG_FILE_PATH, DEFAULT_LOG_LEVEL,
+	DEFAULT_STORAGE_DIR_PATH, WALLET_KEYS_SEED_LEN,
 };
 
 use crate::connection::ConnectionManager;
@@ -111,7 +111,18 @@ impl Default for LiquiditySourceConfig {
 
 #[derive(Clone)]
 enum LogWriterConfig {
-	File(FilesystemLoggerConfig),
+	File {
+		/// The log file path.
+		///
+		/// This specifies the log file path if a destination other than the storage
+		/// directory, i.e. [`Config::storage_dir_path`], is preferred. If unconfigured,
+		/// defaults to [`DEFAULT_LOG_FILENAME`] in default storage directory.
+		log_file_path: Option<String>,
+		/// This specifies the log level.
+		///
+		/// If unconfigured, defaults to `Debug`.
+		log_level: Option<LogLevel>,
+	},
 	Log(LogLevel),
 	Custom(Arc<dyn LogWriter>),
 }
@@ -119,7 +130,11 @@ enum LogWriterConfig {
 impl std::fmt::Debug for LogWriterConfig {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			LogWriterConfig::File(config) => f.debug_tuple("File").field(config).finish(),
+			LogWriterConfig::File { log_level, log_file_path } => f
+				.debug_struct("LogWriterConfig")
+				.field("log_level", log_level)
+				.field("log_file_path", log_file_path)
+				.finish(),
 			LogWriterConfig::Log(level) => f.debug_tuple("Log").field(level).finish(),
 			LogWriterConfig::Custom(_) => {
 				f.debug_tuple("Custom").field(&"<config internal to custom log writer>").finish()
@@ -130,7 +145,10 @@ impl std::fmt::Debug for LogWriterConfig {
 
 impl Default for LogWriterConfig {
 	fn default() -> Self {
-		Self::File(FilesystemLoggerConfig::default())
+		Self::File {
+			log_file_path: Some(DEFAULT_LOG_FILE_PATH.to_string()),
+			log_level: Some(DEFAULT_LOG_LEVEL),
+		}
 	}
 }
 
@@ -337,8 +355,7 @@ impl NodeBuilder {
 	pub fn set_filesystem_logger(
 		&mut self, log_file_path: Option<String>, log_level: Option<LogLevel>,
 	) -> &mut Self {
-		self.log_writer_config =
-			Some(LogWriterConfig::File(FilesystemLoggerConfig { log_file_path, log_level }));
+		self.log_writer_config = Some(LogWriterConfig::File { log_file_path, log_level });
 		self
 	}
 
@@ -1310,11 +1327,11 @@ fn setup_logger(
 		if let Some(conf) = log_writer_conf { conf } else { &default_lw_config };
 
 	let logger = match log_writer_config {
-		LogWriterConfig::File(fs_logger_config) => {
-			let fp = format!("{}/{}", node_conf.storage_dir_path, DEFAULT_LOG_FILENAME);
-			let log_file_path =
-				if let Some(fp) = &fs_logger_config.log_file_path { fp } else { &fp };
-			let log_level = fs_logger_config.log_level.unwrap_or(DEFAULT_LOG_LEVEL);
+		LogWriterConfig::File { log_file_path, log_level } => {
+			let fp = DEFAULT_LOG_FILE_PATH
+				.replace(DEFAULT_STORAGE_DIR_PATH, &node_conf.storage_dir_path);
+			let log_file_path = log_file_path.as_ref().map(|p| p.as_str()).unwrap_or(&fp);
+			let log_level = log_level.unwrap_or(DEFAULT_LOG_LEVEL);
 
 			Logger::new_fs_writer(log_file_path, log_level)
 				.map_err(|_| BuildError::LoggerSetupFailed)?
