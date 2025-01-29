@@ -19,7 +19,6 @@ use ldk_node::payment::{PaymentKind, QrPaymentResult, SendingParameters};
 use ldk_node::{Builder, Event, NodeError};
 
 use lightning::ln::channelmanager::PaymentId;
-use lightning::util::logger::Level;
 use lightning::util::persist::KVStore;
 
 use bitcoincore_rpc::RpcApi;
@@ -222,9 +221,6 @@ fn start_stop_reinit() {
 	sync_config.lightning_wallet_sync_interval_secs = 100000;
 	setup_builder!(builder, config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-
-	let log_file_path = format!("{}/{}", config.storage_dir_path, "ldk_node.log");
-	builder.set_filesystem_logger(Some(log_file_path), Some(Level::Debug));
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
 	node.start().unwrap();
