@@ -116,7 +116,7 @@ enum LogWriterConfig {
 		///
 		/// This specifies the log file path if a destination other than the storage
 		/// directory, i.e. [`Config::storage_dir_path`], is preferred. If unconfigured,
-		/// defaults to [`DEFAULT_LOG_FILENAME`] in default storage directory.
+		/// defaults to [`DEFAULT_LOG_FILE_PATH`] in default storage directory.
 		log_file_path: Option<String>,
 		/// This specifies the log level.
 		///
@@ -349,7 +349,7 @@ impl NodeBuilder {
 
 	/// Configures the [`Node`] instance to write logs to the filesystem.
 	///
-	/// The `log_file_path` defaults to the [`DEFAULT_LOG_FILENAME`] in the default
+	/// The `log_file_path` defaults to the [`DEFAULT_LOG_FILE_PATH`] in the default
 	/// storage directory if set to None.
 	/// The `log_level` defaults to [`DEFAULT_LOG_LEVEL`] if set to None.
 	pub fn set_filesystem_logger(
