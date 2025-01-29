@@ -329,8 +329,11 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to write logs to the filesystem with an optional
-	/// `file_path` and `log_level` arguments.
+	/// Configures the [`Node`] instance to write logs to the filesystem.
+	///
+	/// The `log_file_path` defaults to the [`DEFAULT_LOG_FILENAME`] in the default
+	/// storage directory if set to None.
+	/// The `log_level` defaults to [`DEFAULT_LOG_LEVEL`] if set to None.
 	pub fn set_filesystem_logger(
 		&mut self, log_file_path: Option<String>, log_level: Option<LogLevel>,
 	) -> &mut Self {
