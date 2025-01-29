@@ -124,6 +124,7 @@ class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO) :
         if (isLevelEnabled(recordLevel)) {
             val logMessage = formatRecord(record)
             logMessages.add(logMessage)
+            println("$logMessage")
         }
     }
 
