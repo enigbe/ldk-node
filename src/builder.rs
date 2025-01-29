@@ -1322,6 +1322,7 @@ fn build_with_store_internal(
 fn setup_logger(
 	log_writer_conf: &Option<LogWriterConfig>, node_conf: &Config,
 ) -> Result<Arc<Logger>, BuildError> {
+	let is_default = log_writer_conf.is_none();
 	let default_lw_config = LogWriterConfig::default();
 	let log_writer_config =
 		if let Some(conf) = log_writer_conf { conf } else { &default_lw_config };
@@ -1330,7 +1331,9 @@ fn setup_logger(
 		LogWriterConfig::File { log_file_path, log_level } => {
 			let fp = DEFAULT_LOG_FILE_PATH
 				.replace(DEFAULT_STORAGE_DIR_PATH, &node_conf.storage_dir_path);
-			let log_file_path = log_file_path.as_ref().map(|p| p.as_str()).unwrap_or(&fp);
+			let log_file_path =
+				if is_default { &fp } else { log_file_path.as_ref().map(|p| p).unwrap_or(&fp) };
+
 			let log_level = log_level.unwrap_or(DEFAULT_LOG_LEVEL);
 
 			Logger::new_fs_writer(log_file_path, log_level)
