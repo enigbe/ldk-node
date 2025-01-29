@@ -7,7 +7,7 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_user_config, Config, EsploraSyncConfig, FilesystemLoggerConfig, DEFAULT_LOG_FILE_PATH,
+	default_user_config, Config, EsploraSyncConfig, FilesystemLoggerConfig, DEFAULT_LOG_FILENAME,
 	DEFAULT_LOG_LEVEL, WALLET_KEYS_SEED_LEN,
 };
 
@@ -432,7 +432,7 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		use bitcoin::key::Secp256k1;
 
-		let logger = setup_logger(&self.log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -497,7 +497,7 @@ impl NodeBuilder {
 	pub fn build_with_vss_store_and_header_provider(
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
-		let logger = setup_logger(&self.log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -529,7 +529,7 @@ impl NodeBuilder {
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
-		let logger = setup_logger(&self.log_writer_config)?;
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
 		let seed_bytes = seed_bytes_from_config(
 			&self.config,
@@ -1293,17 +1293,21 @@ fn build_with_store_internal(
 }
 
 /// Sets up the node logger.
-fn setup_logger(config_opt: &Option<LogWriterConfig>) -> Result<Arc<Logger>, BuildError> {
-	let default_config = LogWriterConfig::default();
-	let config = if let Some(conf) = config_opt { conf } else { &default_config };
+///
+/// If `log_writer_conf` is set to None, uses [`LogWriterConfig::default()`].
+/// The `node_conf`is provided to access the configured storage directory.
+fn setup_logger(
+	log_writer_conf: &Option<LogWriterConfig>, node_conf: &Config,
+) -> Result<Arc<Logger>, BuildError> {
+	let default_lw_config = LogWriterConfig::default();
+	let log_writer_config =
+		if let Some(conf) = log_writer_conf { conf } else { &default_lw_config };
 
-	let logger = match config {
+	let logger = match log_writer_config {
 		LogWriterConfig::File(fs_logger_config) => {
-			let log_file_path = if let Some(fp) = &fs_logger_config.log_file_path {
-				fp
-			} else {
-				DEFAULT_LOG_FILE_PATH
-			};
+			let fp = format!("{}/{}", node_conf.storage_dir_path, DEFAULT_LOG_FILENAME);
+			let log_file_path =
+				if let Some(fp) = &fs_logger_config.log_file_path { fp } else { &fp };
 			let log_level = fs_logger_config.log_level.unwrap_or(DEFAULT_LOG_LEVEL);
 
 			Logger::new_fs_writer(log_file_path, log_level)

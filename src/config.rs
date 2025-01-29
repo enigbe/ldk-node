@@ -33,8 +33,8 @@ const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 /// The default log level.
 pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
 
-/// The default log file path.
-pub const DEFAULT_LOG_FILE_PATH: &'static str = "/tmp/ldk_node/ldk_node.log";
+/// The default log filename.
+pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
 
 // The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
 // number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
@@ -440,7 +440,7 @@ pub struct FilesystemLoggerConfig {
 	///
 	/// This specifies the log file path if a destination other than the storage
 	/// directory, i.e. [`Config::storage_dir_path`], is preferred. If unconfigured,
-	/// defaults to [`DEFAULT_LOG_FILE_PATH`]
+	/// defaults to [`DEFAULT_LOG_FILENAME`] in default storage directory.
 	pub log_file_path: Option<String>,
 	/// This specifies the log level.
 	///
@@ -451,7 +451,7 @@ pub struct FilesystemLoggerConfig {
 impl Default for FilesystemLoggerConfig {
 	fn default() -> Self {
 		Self {
-			log_file_path: Some(DEFAULT_LOG_FILE_PATH.to_string()),
+			log_file_path: Some(format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME)),
 			log_level: Some(DEFAULT_LOG_LEVEL),
 		}
 	}
