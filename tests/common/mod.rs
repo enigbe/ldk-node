@@ -8,9 +8,11 @@
 #![cfg(any(test, cln_test, vss_test))]
 #![allow(dead_code)]
 
-use ldk_node::config::{Config, EsploraSyncConfig};
+use ldk_node::config::{
+	Config, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, DEFAULT_STORAGE_DIR_PATH,
+};
 use ldk_node::io::sqlite_store::SqliteStore;
-use ldk_node::logger::LogLevel;
+use ldk_node::logger::{LogLevel, LogWriter};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
 	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
@@ -221,7 +223,7 @@ pub(crate) fn random_node_alias() -> Option<NodeAlias> {
 	Some(NodeAlias(bytes))
 }
 
-pub(crate) fn random_config(anchor_channels: bool) -> Config {
+pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
 	let mut config = Config::default();
 
 	if !anchor_channels {
@@ -243,7 +245,7 @@ pub(crate) fn random_config(anchor_channels: bool) -> Config {
 	println!("Setting random LDK node alias: {:?}", alias);
 	config.node_alias = alias;
 
-	config
+	TestConfig { node_config: config, log_writer: TestLogWriter::default() }
 }
 
 #[cfg(feature = "uniffi")]
@@ -255,6 +257,34 @@ type TestNode = Node;
 pub(crate) enum TestChainSource<'a> {
 	Esplora(&'a ElectrsD),
 	BitcoindRpc(&'a BitcoinD),
+}
+
+#[derive(Clone)]
+pub(crate) enum TestLogWriter {
+	FileWriter { file_path: String, max_log_level: LogLevel },
+	LogFacade { max_log_level: LogLevel },
+	Custom(Arc<dyn LogWriter>),
+}
+
+impl Default for TestLogWriter {
+	fn default() -> Self {
+		TestLogWriter::FileWriter {
+			file_path: format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME),
+			max_log_level: DEFAULT_LOG_LEVEL,
+		}
+	}
+}
+
+#[derive(Clone)]
+pub(crate) struct TestConfig {
+	pub node_config: Config,
+	pub log_writer: TestLogWriter,
+}
+
+impl Default for TestConfig {
+	fn default() -> Self {
+		Self { node_config: Config::default(), log_writer: TestLogWriter::default() }
+	}
 }
 
 macro_rules! setup_builder {
@@ -279,10 +309,11 @@ pub(crate) fn setup_two_nodes(
 	println!("\n== Node B ==");
 	let mut config_b = random_config(anchor_channels);
 	if allow_0conf {
-		config_b.trusted_peers_0conf.push(node_a.node_id());
+		config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
 	}
 	if anchor_channels && anchors_trusted_no_reserve {
 		config_b
+			.node_config
 			.anchor_channels_config
 			.as_mut()
 			.unwrap()
@@ -294,9 +325,9 @@ pub(crate) fn setup_two_nodes(
 }
 
 pub(crate) fn setup_node(
-	chain_source: &TestChainSource, config: Config, seed_bytes: Option<Vec<u8>>,
+	chain_source: &TestChainSource, config: TestConfig, seed_bytes: Option<Vec<u8>>,
 ) -> TestNode {
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	match chain_source {
 		TestChainSource::Esplora(electrsd) => {
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
@@ -315,14 +346,23 @@ pub(crate) fn setup_node(
 		},
 	}
 
-	let log_file_path = format!("{}/{}", config.storage_dir_path, "ldk_node.log");
-	builder.set_filesystem_logger(Some(log_file_path), Some(LogLevel::Gossip));
+	match &config.log_writer {
+		TestLogWriter::FileWriter { file_path, max_log_level } => {
+			builder.set_filesystem_logger(Some(file_path.clone()), Some(*max_log_level));
+		},
+		TestLogWriter::LogFacade { max_log_level } => {
+			builder.set_log_facade_logger(Some(*max_log_level));
+		},
+		TestLogWriter::Custom(custom_log_writer) => {
+			builder.set_custom_logger(Arc::clone(custom_log_writer));
+		},
+	}
 
 	if let Some(seed) = seed_bytes {
 		builder.set_entropy_seed_bytes(seed).unwrap();
 	}
 
-	let test_sync_store = Arc::new(TestSyncStore::new(config.storage_dir_path.into()));
+	let test_sync_store = Arc::new(TestSyncStore::new(config.node_config.storage_dir_path.into()));
 	let node = builder.build_with_store(test_sync_store).unwrap();
 	node.start().unwrap();
 	assert!(node.status().is_running);

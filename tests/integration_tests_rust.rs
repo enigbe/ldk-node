@@ -127,7 +127,7 @@ fn multi_hop_sending() {
 		let mut sync_config = EsploraSyncConfig::default();
 		sync_config.onchain_wallet_sync_interval_secs = 100000;
 		sync_config.lightning_wallet_sync_interval_secs = 100000;
-		setup_builder!(builder, config);
+		setup_builder!(builder, config.node_config);
 		builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		let node = builder.build().unwrap();
 		node.start().unwrap();
@@ -222,12 +222,12 @@ fn start_stop_reinit() {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let test_sync_store: Arc<dyn KVStore + Sync + Send> =
-		Arc::new(TestSyncStore::new(config.storage_dir_path.clone().into()));
+		Arc::new(TestSyncStore::new(config.node_config.storage_dir_path.clone().into()));
 
 	let mut sync_config = EsploraSyncConfig::default();
 	sync_config.onchain_wallet_sync_interval_secs = 100000;
 	sync_config.lightning_wallet_sync_interval_secs = 100000;
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -251,7 +251,7 @@ fn start_stop_reinit() {
 	node.sync_wallets().unwrap();
 	assert_eq!(node.list_balances().spendable_onchain_balance_sats, expected_amount.to_sat());
 
-	let log_file = format!("{}/ldk_node.log", config.clone().storage_dir_path);
+	let log_file = format!("{}/ldk_node.log", config.node_config.clone().storage_dir_path);
 	assert!(std::path::Path::new(&log_file).exists());
 
 	node.stop().unwrap();
@@ -264,7 +264,7 @@ fn start_stop_reinit() {
 	assert_eq!(node.stop(), Err(NodeError::NotRunning));
 	drop(node);
 
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let reinitialized_node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
