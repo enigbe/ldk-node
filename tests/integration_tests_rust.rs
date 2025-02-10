@@ -9,12 +9,14 @@ mod common;
 
 use common::{
 	do_channel_full_cycle, expect_channel_ready_event, expect_event, expect_payment_received_event,
-	expect_payment_successful_event, generate_blocks_and_wait, open_channel,
-	premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd, setup_builder,
-	setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
+	expect_payment_successful_event, generate_blocks_and_wait, init_custom_logger, init_log_logger,
+	open_channel, premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd,
+	setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestLogWriter,
+	TestSyncStore,
 };
 
 use ldk_node::config::EsploraSyncConfig;
+use ldk_node::logger::LogLevel;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
 	SendingParameters,
@@ -28,6 +30,7 @@ use bitcoincore_rpc::RpcApi;
 
 use bitcoin::Amount;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
+use log::LevelFilter;
 
 use std::sync::Arc;
 
@@ -126,7 +129,7 @@ fn multi_hop_sending() {
 		let mut sync_config = EsploraSyncConfig::default();
 		sync_config.onchain_wallet_sync_interval_secs = 100000;
 		sync_config.lightning_wallet_sync_interval_secs = 100000;
-		setup_builder!(builder, config);
+		setup_builder!(builder, config.node_config);
 		builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		let node = builder.build().unwrap();
 		node.start().unwrap();
@@ -217,12 +220,12 @@ fn start_stop_reinit() {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let test_sync_store: Arc<dyn KVStore + Sync + Send> =
-		Arc::new(TestSyncStore::new(config.storage_dir_path.clone().into()));
+		Arc::new(TestSyncStore::new(config.node_config.storage_dir_path.clone().into()));
 
 	let mut sync_config = EsploraSyncConfig::default();
 	sync_config.onchain_wallet_sync_interval_secs = 100000;
 	sync_config.lightning_wallet_sync_interval_secs = 100000;
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -246,7 +249,7 @@ fn start_stop_reinit() {
 	node.sync_wallets().unwrap();
 	assert_eq!(node.list_balances().spendable_onchain_balance_sats, expected_amount.to_sat());
 
-	let log_file = format!("{}/ldk_node.log", config.clone().storage_dir_path);
+	let log_file = format!("{}/ldk_node.log", config.node_config.clone().storage_dir_path);
 	assert!(std::path::Path::new(&log_file).exists());
 
 	node.stop().unwrap();
@@ -259,7 +262,7 @@ fn start_stop_reinit() {
 	assert_eq!(node.stop(), Err(NodeError::NotRunning));
 	drop(node);
 
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let reinitialized_node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -989,4 +992,35 @@ fn unified_qr_send_receive() {
 
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 800_000);
 	assert_eq!(node_b.list_balances().total_lightning_balance_sats, 200_000);
+}
+
+#[test]
+fn facade_logging() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let logger = init_log_logger(LevelFilter::Trace);
+	let mut config = random_config(false);
+	config.log_writer = TestLogWriter::LogFacade { max_log_level: LogLevel::Gossip };
+
+	println!("== Facade logging start ==");
+	let _node = setup_node(&chain_source, config, None);
+	println!("== Facade logging end ==");
+
+	assert!(!logger.retrieve_logs().is_empty());
+}
+
+#[test]
+fn custom_logging() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let logger = init_custom_logger();
+	let mut config = random_config(false);
+	config.log_writer = TestLogWriter::Custom(logger.clone());
+
+	println!("== Custom logging start ==");
+	let _node = setup_node(&chain_source, config, None);
+	println!("== Custom logging end ==");
+
+	assert!(!logger.retrieve_logs().is_empty());
 }
