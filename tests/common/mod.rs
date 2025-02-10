@@ -8,11 +8,12 @@
 #![cfg(any(test, cln_test, vss_test))]
 #![allow(dead_code)]
 
+use chrono::Utc;
 use ldk_node::config::{
 	Config, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, DEFAULT_STORAGE_DIR_PATH,
 };
 use ldk_node::io::sqlite_store::SqliteStore;
-use ldk_node::logger::{LogLevel, LogWriter};
+use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
 	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
@@ -39,12 +40,13 @@ use bitcoincore_rpc::RpcApi;
 use electrsd::{bitcoind, bitcoind::BitcoinD, ElectrsD};
 use electrum_client::ElectrumApi;
 
+use log::{Level, LevelFilter, Log, Record};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 macro_rules! expect_event {
@@ -1206,4 +1208,91 @@ impl KVStore for TestSyncStore {
 		let _guard = self.serializer.read().unwrap();
 		self.do_list(primary_namespace, secondary_namespace)
 	}
+}
+
+pub(crate) struct MockLogger {
+	logs: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockLogger {
+	pub fn new() -> Self {
+		Self { logs: Arc::new(Mutex::new(Vec::new())) }
+	}
+
+	pub fn retrieve_logs(&self) -> Vec<String> {
+		self.logs.lock().unwrap().to_vec()
+	}
+}
+
+impl Log for MockLogger {
+	fn enabled(&self, _metadata: &log::Metadata) -> bool {
+		true
+	}
+
+	fn log(&self, record: &log::Record) {
+		let message = format!(
+			"{} {:<5} [{}:{}] {}",
+			Utc::now().format("%Y-%m-%d %H:%M:%S"),
+			record.level().to_string(),
+			record.module_path().unwrap(),
+			record.line().unwrap(),
+			record.args()
+		);
+		println!("{message}");
+		self.logs.lock().unwrap().push(message);
+	}
+
+	fn flush(&self) {}
+}
+
+impl LogWriter for MockLogger {
+	fn log<'a>(&self, record: LogRecord) {
+		let record = MockLogRecord(record).into();
+		Log::log(self, &record);
+	}
+}
+
+struct MockLogRecord<'a>(LogRecord<'a>);
+struct MockLogLevel(LogLevel);
+
+impl From<MockLogLevel> for Level {
+	fn from(level: MockLogLevel) -> Self {
+		match level.0 {
+			LogLevel::Gossip | LogLevel::Trace => Level::Trace,
+			LogLevel::Debug => Level::Debug,
+			LogLevel::Info => Level::Info,
+			LogLevel::Warn => Level::Warn,
+			LogLevel::Error => Level::Error,
+		}
+	}
+}
+
+impl<'a> From<MockLogRecord<'a>> for Record<'a> {
+	fn from(log_record: MockLogRecord<'a>) -> Self {
+		let log_record = log_record.0;
+		let level = MockLogLevel(log_record.level).into();
+
+		let mut record_builder = Record::builder();
+		let record = record_builder
+			.level(level)
+			.module_path(Some(log_record.module_path))
+			.line(Some(log_record.line))
+			.args(log_record.args);
+
+		record.build()
+	}
+}
+
+pub(crate) fn init_log_logger(level: LevelFilter) -> Arc<MockLogger> {
+	let logger = Arc::new(MockLogger::new());
+	log::set_boxed_logger(Box::new(logger.clone())).unwrap();
+	log::set_max_level(level);
+
+	logger
+}
+
+pub(crate) fn init_custom_logger() -> Arc<MockLogger> {
+	let logger = Arc::new(MockLogger::new());
+
+	logger
 }
