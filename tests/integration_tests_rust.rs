@@ -8,14 +8,13 @@
 mod common;
 
 use common::{
-	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event,
-	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
-	open_channel, premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd,
-	setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
+	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event, expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait, init_custom_logger, init_log_logger, open_channel, premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestLogWriter, TestSyncStore
 };
 
 use ldk_node::config::EsploraSyncConfig;
 use ldk_node::liquidity::LSPS2ServiceConfig;
+
+use ldk_node::logger::LogLevel;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
 	SendingParameters,
@@ -30,6 +29,7 @@ use bitcoincore_rpc::RpcApi;
 use bitcoin::hashes::Hash;
 use bitcoin::Amount;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
+use log::LevelFilter;
 
 use std::sync::Arc;
 
@@ -1066,7 +1066,7 @@ fn lsps2_client_service_integration() {
 	};
 
 	let service_config = random_config(true);
-	setup_builder!(service_builder, service_config);
+	setup_builder!(service_builder, service_config.node_config);
 	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	service_builder.set_liquidity_provider_lsps2(lsps2_service_config);
 	let service_node = service_builder.build().unwrap();
@@ -1076,14 +1076,14 @@ fn lsps2_client_service_integration() {
 	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
 
 	let client_config = random_config(true);
-	setup_builder!(client_builder, client_config);
+	setup_builder!(client_builder, client_config.node_config);
 	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	client_builder.set_liquidity_source_lsps2(service_node_id, service_addr, None);
 	let client_node = client_builder.build().unwrap();
 	client_node.start().unwrap();
 
 	let payer_config = random_config(true);
-	setup_builder!(payer_builder, payer_config);
+	setup_builder!(payer_builder, payer_config.node_config);
 	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	let payer_node = payer_builder.build().unwrap();
 	payer_node.start().unwrap();
@@ -1143,4 +1143,35 @@ fn lsps2_client_service_integration() {
 		(expected_received_amount_msat + expected_channel_overprovisioning_msat) / 1000;
 	let channel_value_sats = client_node.list_channels().first().unwrap().channel_value_sats;
 	assert_eq!(channel_value_sats, expected_channel_size_sat);
+}
+
+#[test]
+fn facade_logging() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let logger = init_log_logger(LevelFilter::Trace);
+	let mut config = random_config(false);
+	config.log_writer = TestLogWriter::LogFacade { max_log_level: LogLevel::Gossip };
+
+	println!("== Facade logging start ==");
+	let _node = setup_node(&chain_source, config, None);
+	println!("== Facade logging end ==");
+
+	assert!(!logger.retrieve_logs().is_empty());
+}
+
+#[test]
+fn custom_logging() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let logger = init_custom_logger();
+	let mut config = random_config(false);
+	config.log_writer = TestLogWriter::Custom(logger.clone());
+
+	println!("== Custom logging start ==");
+	let _node = setup_node(&chain_source, config, None);
+	println!("== Custom logging end ==");
+
+	assert!(!logger.retrieve_logs().is_empty());
 }
