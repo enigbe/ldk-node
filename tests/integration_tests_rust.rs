@@ -7,12 +7,12 @@
 
 mod common;
 
+use common::logging::{init_custom_logger, init_log_logger, validate_log_entry, TestLogWriter};
 use common::{
 	do_channel_full_cycle, expect_channel_ready_event, expect_event, expect_payment_received_event,
-	expect_payment_successful_event, generate_blocks_and_wait, init_custom_logger, init_log_logger,
-	open_channel, premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd,
-	setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestLogWriter,
-	TestSyncStore,
+	expect_payment_successful_event, generate_blocks_and_wait, open_channel,
+	premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd, setup_builder,
+	setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
 };
 
 use ldk_node::config::EsploraSyncConfig;
@@ -1049,13 +1049,15 @@ fn facade_logging() {
 
 	let logger = init_log_logger(LevelFilter::Trace);
 	let mut config = random_config(false);
-	config.log_writer = TestLogWriter::LogFacade { max_log_level: LogLevel::Gossip };
+	config.log_writer = TestLogWriter::LogFacade(LogLevel::Gossip);
 
-	println!("== Facade logging start ==");
+	println!("== Facade logging starts ==");
 	let _node = setup_node(&chain_source, config, None);
-	println!("== Facade logging end ==");
 
 	assert!(!logger.retrieve_logs().is_empty());
+	for (_, entry) in logger.retrieve_logs().iter().enumerate() {
+		validate_log_entry(entry);
+	}
 }
 
 #[test]
@@ -1066,9 +1068,11 @@ fn custom_logging() {
 	let mut config = random_config(false);
 	config.log_writer = TestLogWriter::Custom(logger.clone());
 
-	println!("== Custom logging start ==");
+	println!("== Custom logging starts ==");
 	let _node = setup_node(&chain_source, config, None);
-	println!("== Custom logging end ==");
 
 	assert!(!logger.retrieve_logs().is_empty());
+	for (_, entry) in logger.retrieve_logs().iter().enumerate() {
+		validate_log_entry(entry);
+	}
 }
