@@ -7,13 +7,14 @@
 
 #![cfg(any(test, cln_test, vss_test))]
 #![allow(dead_code)]
+pub(crate) mod logging;
 
-use chrono::Utc;
+use logging::TestLogWriter;
+
 use ldk_node::config::{
 	Config, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, DEFAULT_STORAGE_DIR_PATH,
 };
 use ldk_node::io::sqlite_store::SqliteStore;
-use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
 	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
@@ -40,13 +41,12 @@ use bitcoincore_rpc::RpcApi;
 use electrsd::{bitcoind, bitcoind::BitcoinD, ElectrsD};
 use electrum_client::ElectrumApi;
 
-use log::{Level, LevelFilter, Log, Record};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 macro_rules! expect_event {
@@ -226,28 +226,28 @@ pub(crate) fn random_node_alias() -> Option<NodeAlias> {
 }
 
 pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
-	let mut config = Config::default();
+	let mut node_config = Config::default();
 
 	if !anchor_channels {
-		config.anchor_channels_config = None;
+		node_config.anchor_channels_config = None;
 	}
 
-	config.network = Network::Regtest;
-	println!("Setting network: {}", config.network);
+	node_config.network = Network::Regtest;
+	println!("Setting network: {}", node_config.network);
 
 	let rand_dir = random_storage_path();
 	println!("Setting random LDK storage dir: {}", rand_dir.display());
-	config.storage_dir_path = rand_dir.to_str().unwrap().to_owned();
+	node_config.storage_dir_path = rand_dir.to_str().unwrap().to_owned();
 
 	let rand_listening_addresses = random_listening_addresses();
 	println!("Setting random LDK listening addresses: {:?}", rand_listening_addresses);
-	config.listening_addresses = Some(rand_listening_addresses);
+	node_config.listening_addresses = Some(rand_listening_addresses);
 
 	let alias = random_node_alias();
 	println!("Setting random LDK node alias: {:?}", alias);
-	config.node_alias = alias;
+	node_config.node_alias = alias;
 
-	TestConfig { node_config: config, log_writer: TestLogWriter::default() }
+	TestConfig { node_config, ..Default::default() }
 }
 
 #[cfg(feature = "uniffi")]
@@ -261,32 +261,10 @@ pub(crate) enum TestChainSource<'a> {
 	BitcoindRpc(&'a BitcoinD),
 }
 
-#[derive(Clone)]
-pub(crate) enum TestLogWriter {
-	FileWriter { file_path: String, max_log_level: LogLevel },
-	LogFacade { max_log_level: LogLevel },
-	Custom(Arc<dyn LogWriter>),
-}
-
-impl Default for TestLogWriter {
-	fn default() -> Self {
-		TestLogWriter::FileWriter {
-			file_path: format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME),
-			max_log_level: DEFAULT_LOG_LEVEL,
-		}
-	}
-}
-
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct TestConfig {
 	pub node_config: Config,
 	pub log_writer: TestLogWriter,
-}
-
-impl Default for TestConfig {
-	fn default() -> Self {
-		Self { node_config: Config::default(), log_writer: TestLogWriter::default() }
-	}
 }
 
 macro_rules! setup_builder {
@@ -349,10 +327,12 @@ pub(crate) fn setup_node(
 	}
 
 	match &config.log_writer {
-		TestLogWriter::FileWriter { file_path, max_log_level } => {
-			builder.set_filesystem_logger(Some(file_path.clone()), Some(*max_log_level));
+		TestLogWriter::FileWriter => {
+			let file_path = format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME);
+			let max_log_level = DEFAULT_LOG_LEVEL;
+			builder.set_filesystem_logger(Some(file_path), Some(max_log_level));
 		},
-		TestLogWriter::LogFacade { max_log_level } => {
+		TestLogWriter::LogFacade(max_log_level) => {
 			builder.set_log_facade_logger(Some(*max_log_level));
 		},
 		TestLogWriter::Custom(custom_log_writer) => {
@@ -1214,91 +1194,4 @@ impl KVStore for TestSyncStore {
 		let _guard = self.serializer.read().unwrap();
 		self.do_list(primary_namespace, secondary_namespace)
 	}
-}
-
-pub(crate) struct MockLogger {
-	logs: Arc<Mutex<Vec<String>>>,
-}
-
-impl MockLogger {
-	pub fn new() -> Self {
-		Self { logs: Arc::new(Mutex::new(Vec::new())) }
-	}
-
-	pub fn retrieve_logs(&self) -> Vec<String> {
-		self.logs.lock().unwrap().to_vec()
-	}
-}
-
-impl Log for MockLogger {
-	fn enabled(&self, _metadata: &log::Metadata) -> bool {
-		true
-	}
-
-	fn log(&self, record: &log::Record) {
-		let message = format!(
-			"{} {:<5} [{}:{}] {}",
-			Utc::now().format("%Y-%m-%d %H:%M:%S"),
-			record.level().to_string(),
-			record.module_path().unwrap(),
-			record.line().unwrap(),
-			record.args()
-		);
-		println!("{message}");
-		self.logs.lock().unwrap().push(message);
-	}
-
-	fn flush(&self) {}
-}
-
-impl LogWriter for MockLogger {
-	fn log<'a>(&self, record: LogRecord) {
-		let record = MockLogRecord(record).into();
-		Log::log(self, &record);
-	}
-}
-
-struct MockLogRecord<'a>(LogRecord<'a>);
-struct MockLogLevel(LogLevel);
-
-impl From<MockLogLevel> for Level {
-	fn from(level: MockLogLevel) -> Self {
-		match level.0 {
-			LogLevel::Gossip | LogLevel::Trace => Level::Trace,
-			LogLevel::Debug => Level::Debug,
-			LogLevel::Info => Level::Info,
-			LogLevel::Warn => Level::Warn,
-			LogLevel::Error => Level::Error,
-		}
-	}
-}
-
-impl<'a> From<MockLogRecord<'a>> for Record<'a> {
-	fn from(log_record: MockLogRecord<'a>) -> Self {
-		let log_record = log_record.0;
-		let level = MockLogLevel(log_record.level).into();
-
-		let mut record_builder = Record::builder();
-		let record = record_builder
-			.level(level)
-			.module_path(Some(log_record.module_path))
-			.line(Some(log_record.line))
-			.args(log_record.args);
-
-		record.build()
-	}
-}
-
-pub(crate) fn init_log_logger(level: LevelFilter) -> Arc<MockLogger> {
-	let logger = Arc::new(MockLogger::new());
-	log::set_boxed_logger(Box::new(logger.clone())).unwrap();
-	log::set_max_level(level);
-
-	logger
-}
-
-pub(crate) fn init_custom_logger() -> Arc<MockLogger> {
-	let logger = Arc::new(MockLogger::new());
-
-	logger
 }
