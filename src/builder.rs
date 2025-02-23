@@ -18,7 +18,7 @@ use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{read_node_metrics, write_node_metrics};
 use crate::io::vss_store::VssStore;
-use crate::liquidity::LiquiditySource;
+use crate::liquidity::LiquiditySourceBuilder;
 use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::store::PaymentStore;
@@ -53,9 +53,6 @@ use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
 
 use lightning_persister::fs_store::FilesystemStore;
-
-use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityManager};
 
 use bdk_wallet::template::Bip84;
 use bdk_wallet::KeychainKind;
@@ -99,20 +96,22 @@ enum GossipSourceConfig {
 
 #[derive(Debug, Clone)]
 struct LiquiditySourceConfig {
-	// LSPS2 service's (address, node_id, token)
-	lsps2_service: Option<(SocketAddress, PublicKey, Option<String>)>,
+	// LSPS1 service's (node_id, address, token)
+	lsps1_service: Option<(PublicKey, SocketAddress, Option<String>)>,
+	// LSPS2 service's (node_id, address, token)
+	lsps2_service: Option<(PublicKey, SocketAddress, Option<String>)>,
 }
 
 impl Default for LiquiditySourceConfig {
 	fn default() -> Self {
-		Self { lsps2_service: None }
+		Self { lsps1_service: None, lsps2_service: None }
 	}
 }
 
 #[derive(Clone)]
 enum LogWriterConfig {
 	File { log_file_path: Option<String>, max_log_level: Option<LogLevel> },
-	Log { max_log_level: Option<LogLevel> },
+	Log,
 	Custom(Arc<dyn LogWriter>),
 }
 
@@ -124,9 +123,7 @@ impl std::fmt::Debug for LogWriterConfig {
 				.field("max_log_level", max_log_level)
 				.field("log_file_path", log_file_path)
 				.finish(),
-			LogWriterConfig::Log { max_log_level } => {
-				f.debug_tuple("Log").field(max_log_level).finish()
-			},
+			LogWriterConfig::Log => write!(f, "LogWriterConfig::Log"),
 			LogWriterConfig::Custom(_) => {
 				f.debug_tuple("Custom").field(&"<config internal to custom log writer>").finish()
 			},
@@ -304,22 +301,43 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to source its inbound liquidity from the given
-	/// [LSPS2](https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md)
-	/// service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given
+	/// [bLIP-51 / LSPS1] service.
 	///
 	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
-	pub fn set_liquidity_source_lsps2(
-		&mut self, address: SocketAddress, node_id: PublicKey, token: Option<String>,
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	pub fn set_liquidity_source_lsps1(
+		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
 	) -> &mut Self {
 		// Mark the LSP as trusted for 0conf
 		self.config.trusted_peers_0conf.push(node_id.clone());
 
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		liquidity_source_config.lsps2_service = Some((address, node_id, token));
+		liquidity_source_config.lsps1_service = Some((node_id, address, token));
+		self
+	}
+
+	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
+	/// [bLIP-52 / LSPS2] service.
+	///
+	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	///
+	/// The given `token` will be used by the LSP to authenticate the user.
+	///
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	pub fn set_liquidity_source_lsps2(
+		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+	) -> &mut Self {
+		// Mark the LSP as trusted for 0conf
+		self.config.trusted_peers_0conf.push(node_id.clone());
+
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps2_service = Some((node_id, address, token));
 		self
 	}
 
@@ -346,11 +364,8 @@ impl NodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
-	///
-	/// If set, the `max_log_level` sets the maximum log level. Otherwise, the latter defaults to
-	/// [`DEFAULT_LOG_LEVEL`].
-	pub fn set_log_facade_logger(&mut self, max_log_level: Option<LogLevel>) -> &mut Self {
-		self.log_writer_config = Some(LogWriterConfig::Log { max_log_level });
+	pub fn set_log_facade_logger(&mut self) -> &mut Self {
+		self.log_writer_config = Some(LogWriterConfig::Log);
 		self
 	}
 
@@ -643,17 +658,32 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_gossip_source_rgs(rgs_server_url);
 	}
 
-	/// Configures the [`Node`] instance to source its inbound liquidity from the given
-	/// [LSPS2](https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md)
-	/// service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given
+	/// [bLIP-51 / LSPS1] service.
 	///
 	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
-	pub fn set_liquidity_source_lsps2(
-		&self, address: SocketAddress, node_id: PublicKey, token: Option<String>,
+	///
+	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	pub fn set_liquidity_source_lsps1(
+		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
 	) {
-		self.inner.write().unwrap().set_liquidity_source_lsps2(address, node_id, token);
+		self.inner.write().unwrap().set_liquidity_source_lsps1(node_id, address, token);
+	}
+
+	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
+	/// [bLIP-52 / LSPS2] service.
+	///
+	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	///
+	/// The given `token` will be used by the LSP to authenticate the user.
+	///
+	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
+	pub fn set_liquidity_source_lsps2(
+		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+	) {
+		self.inner.write().unwrap().set_liquidity_source_lsps2(node_id, address, token);
 	}
 
 	/// Sets the used storage directory path.
@@ -677,11 +707,8 @@ impl ArcedNodeBuilder {
 	}
 
 	/// Configures the [`Node`] instance to write logs to the [`log`](https://crates.io/crates/log) facade.
-	///
-	/// If set, the `max_log_level` sets the maximum log level. Otherwise, the latter defaults to
-	/// [`DEFAULT_LOG_LEVEL`].
-	pub fn set_log_facade_logger(&self, log_level: Option<LogLevel>) {
-		self.inner.write().unwrap().set_log_facade_logger(log_level);
+	pub fn set_log_facade_logger(&self) {
+		self.inner.write().unwrap().set_log_facade_logger();
 	}
 
 	/// Configures the [`Node`] instance to write logs to the provided custom [`LogWriter`].
@@ -1136,30 +1163,24 @@ fn build_with_store_internal(
 		},
 	};
 
-	let liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
-		lsc.lsps2_service.as_ref().map(|(address, node_id, token)| {
-			let lsps2_client_config = Some(LSPS2ClientConfig {});
-			let liquidity_client_config =
-				Some(LiquidityClientConfig { lsps1_client_config: None, lsps2_client_config });
-			let liquidity_manager = Arc::new(LiquidityManager::new(
-				Arc::clone(&keys_manager),
-				Arc::clone(&channel_manager),
-				Some(Arc::clone(&chain_source)),
-				None,
-				None,
-				liquidity_client_config,
-			));
-			Arc::new(LiquiditySource::new_lsps2(
-				address.clone(),
-				*node_id,
-				token.clone(),
-				Arc::clone(&channel_manager),
-				Arc::clone(&keys_manager),
-				liquidity_manager,
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			))
-		})
+	let liquidity_source = liquidity_source_config.as_ref().map(|lsc| {
+		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+			Arc::clone(&channel_manager),
+			Arc::clone(&keys_manager),
+			Arc::clone(&chain_source),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		);
+
+		lsc.lsps1_service.as_ref().map(|(node_id, address, token)| {
+			liquidity_source_builder.lsps1_service(*node_id, address.clone(), token.clone())
+		});
+
+		lsc.lsps2_service.as_ref().map(|(node_id, address, token)| {
+			liquidity_source_builder.lsps2_service(*node_id, address.clone(), token.clone())
+		});
+
+		Arc::new(liquidity_source_builder.build())
 	});
 
 	let custom_message_handler = if let Some(liquidity_source) = liquidity_source.as_ref() {
@@ -1326,10 +1347,7 @@ fn setup_logger(
 			Logger::new_fs_writer(log_file_path, max_log_level)
 				.map_err(|_| BuildError::LoggerSetupFailed)?
 		},
-		Some(LogWriterConfig::Log { max_log_level }) => {
-			let max_log_level = max_log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL);
-			Logger::new_log_facade(max_log_level)
-		},
+		Some(LogWriterConfig::Log) => Logger::new_log_facade(),
 
 		Some(LogWriterConfig::Custom(custom_log_writer)) => {
 			Logger::new_custom_writer(Arc::clone(&custom_log_writer))

@@ -7,6 +7,7 @@
 
 mod common;
 
+use common::logging::{init_log_logger, validate_log_entry, TestLogWriter};
 use common::{
 	do_channel_full_cycle, expect_channel_ready_event, expect_event, expect_payment_received_event,
 	expect_payment_successful_event, generate_blocks_and_wait, open_channel,
@@ -26,8 +27,10 @@ use lightning::util::persist::KVStore;
 
 use bitcoincore_rpc::RpcApi;
 
+use bitcoin::hashes::Hash;
 use bitcoin::Amount;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
+use log::LevelFilter;
 
 use std::sync::Arc;
 
@@ -126,7 +129,7 @@ fn multi_hop_sending() {
 		let mut sync_config = EsploraSyncConfig::default();
 		sync_config.onchain_wallet_sync_interval_secs = 100000;
 		sync_config.lightning_wallet_sync_interval_secs = 100000;
-		setup_builder!(builder, config);
+		setup_builder!(builder, config.node_config);
 		builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		let node = builder.build().unwrap();
 		node.start().unwrap();
@@ -202,7 +205,11 @@ fn multi_hop_sending() {
 	nodes[0].bolt11_payment().send(&invoice, Some(sending_params)).unwrap();
 
 	expect_event!(nodes[1], PaymentForwarded);
-	expect_event!(nodes[2], PaymentForwarded);
+
+	// We expect that the payment goes through N2 or N3, so we check both for the PaymentForwarded event.
+	let node_2_fwd_event = matches!(nodes[2].next_event(), Some(Event::PaymentForwarded { .. }));
+	let node_3_fwd_event = matches!(nodes[3].next_event(), Some(Event::PaymentForwarded { .. }));
+	assert!(node_2_fwd_event || node_3_fwd_event);
 
 	let payment_id = expect_payment_received_event!(&nodes[4], 2_500_000);
 	let fee_paid_msat = Some(2000);
@@ -217,12 +224,12 @@ fn start_stop_reinit() {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let test_sync_store: Arc<dyn KVStore + Sync + Send> =
-		Arc::new(TestSyncStore::new(config.storage_dir_path.clone().into()));
+		Arc::new(TestSyncStore::new(config.node_config.storage_dir_path.clone().into()));
 
 	let mut sync_config = EsploraSyncConfig::default();
 	sync_config.onchain_wallet_sync_interval_secs = 100000;
 	sync_config.lightning_wallet_sync_interval_secs = 100000;
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -246,7 +253,7 @@ fn start_stop_reinit() {
 	node.sync_wallets().unwrap();
 	assert_eq!(node.list_balances().spendable_onchain_balance_sats, expected_amount.to_sat());
 
-	let log_file = format!("{}/ldk_node.log", config.clone().storage_dir_path);
+	let log_file = format!("{}/ldk_node.log", config.node_config.clone().storage_dir_path);
 	assert!(std::path::Path::new(&log_file).exists());
 
 	node.stop().unwrap();
@@ -259,7 +266,7 @@ fn start_stop_reinit() {
 	assert_eq!(node.stop(), Err(NodeError::NotRunning));
 	drop(node);
 
-	setup_builder!(builder, config);
+	setup_builder!(builder, config.node_config);
 	builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 
 	let reinitialized_node = builder.build_with_store(Arc::clone(&test_sync_store)).unwrap();
@@ -281,7 +288,7 @@ fn start_stop_reinit() {
 }
 
 #[test]
-fn onchain_spend_receive() {
+fn onchain_send_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
 	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
@@ -352,12 +359,37 @@ fn onchain_spend_receive() {
 		node_a.onchain_payment().send_to_address(&addr_b, expected_node_a_balance + 1, None)
 	);
 
-	let amount_to_send_sats = 1000;
+	let amount_to_send_sats = 54321;
 	let txid =
 		node_b.onchain_payment().send_to_address(&addr_a, amount_to_send_sats, None).unwrap();
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
 	wait_for_tx(&electrsd.client, txid);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
 
+	let payment_id = PaymentId(txid.to_byte_array());
+	let payment_a = node_a.payment(&payment_id).unwrap();
+	assert_eq!(payment_a.status, PaymentStatus::Pending);
+	match payment_a.kind {
+		PaymentKind::Onchain { status, .. } => {
+			assert!(matches!(status, ConfirmationStatus::Unconfirmed));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+	assert!(payment_a.fee_paid_msat > Some(0));
+	let payment_b = node_b.payment(&payment_id).unwrap();
+	assert_eq!(payment_b.status, PaymentStatus::Pending);
+	match payment_a.kind {
+		PaymentKind::Onchain { status, .. } => {
+			assert!(matches!(status, ConfirmationStatus::Unconfirmed));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+	assert!(payment_b.fee_paid_msat > Some(0));
+	assert_eq!(payment_a.amount_msat, Some(amount_to_send_sats * 1000));
+	assert_eq!(payment_a.amount_msat, payment_b.amount_msat);
+	assert_eq!(payment_a.fee_paid_msat, payment_b.fee_paid_msat);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -374,6 +406,24 @@ fn onchain_spend_receive() {
 	let node_b_payments =
 		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Onchain { .. }));
 	assert_eq!(node_b_payments.len(), 3);
+
+	let payment_a = node_a.payment(&payment_id).unwrap();
+	match payment_a.kind {
+		PaymentKind::Onchain { txid: _txid, status } => {
+			assert_eq!(_txid, txid);
+			assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+
+	let payment_b = node_a.payment(&payment_id).unwrap();
+	match payment_b.kind {
+		PaymentKind::Onchain { txid: _txid, status } => {
+			assert_eq!(_txid, txid);
+			assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
 
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
 	let txid = node_a.onchain_payment().send_all_to_address(&addr_b, true, None).unwrap();
@@ -989,4 +1039,22 @@ fn unified_qr_send_receive() {
 
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 800_000);
 	assert_eq!(node_b.list_balances().total_lightning_balance_sats, 200_000);
+}
+
+#[test]
+fn facade_logging() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let logger = init_log_logger(LevelFilter::Trace);
+	let mut config = random_config(false);
+	config.log_writer = TestLogWriter::LogFacade;
+
+	println!("== Facade logging starts ==");
+	let _node = setup_node(&chain_source, config, None);
+
+	assert!(!logger.retrieve_logs().is_empty());
+	for (_, entry) in logger.retrieve_logs().iter().enumerate() {
+		validate_log_entry(entry);
+	}
 }
