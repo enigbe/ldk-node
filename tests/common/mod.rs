@@ -11,9 +11,7 @@ pub(crate) mod logging;
 
 use logging::TestLogWriter;
 
-use ldk_node::config::{
-	Config, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, DEFAULT_STORAGE_DIR_PATH,
-};
+use ldk_node::config::{Config, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
@@ -328,9 +326,7 @@ pub(crate) fn setup_node(
 
 	match &config.log_writer {
 		TestLogWriter::FileWriter => {
-			let file_path = format!("{}/{}", DEFAULT_STORAGE_DIR_PATH, DEFAULT_LOG_FILENAME);
-			let max_log_level = DEFAULT_LOG_LEVEL;
-			builder.set_filesystem_logger(Some(file_path), Some(max_log_level));
+			builder.set_filesystem_logger(None, None);
 		},
 		TestLogWriter::LogFacade(max_log_level) => {
 			builder.set_log_facade_logger(Some(*max_log_level));

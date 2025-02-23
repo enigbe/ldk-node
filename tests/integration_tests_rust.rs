@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::logging::{init_custom_logger, init_log_logger, validate_log_entry, TestLogWriter};
+use common::logging::{init_log_logger, validate_log_entry, TestLogWriter};
 use common::{
 	do_channel_full_cycle, expect_channel_ready_event, expect_event, expect_payment_received_event,
 	expect_payment_successful_event, generate_blocks_and_wait, open_channel,
@@ -1052,23 +1052,6 @@ fn facade_logging() {
 	config.log_writer = TestLogWriter::LogFacade(LogLevel::Gossip);
 
 	println!("== Facade logging starts ==");
-	let _node = setup_node(&chain_source, config, None);
-
-	assert!(!logger.retrieve_logs().is_empty());
-	for (_, entry) in logger.retrieve_logs().iter().enumerate() {
-		validate_log_entry(entry);
-	}
-}
-
-#[test]
-fn custom_logging() {
-	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let chain_source = TestChainSource::Esplora(&electrsd);
-	let logger = init_custom_logger();
-	let mut config = random_config(false);
-	config.log_writer = TestLogWriter::Custom(logger.clone());
-
-	println!("== Custom logging starts ==");
 	let _node = setup_node(&chain_source, config, None);
 
 	assert!(!logger.retrieve_logs().is_empty());
