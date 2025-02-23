@@ -10,7 +10,7 @@ mod common;
 use common::{
 	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event,
 	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
-	logging::{init_custom_logger, init_log_logger, validate_log_entry, TestLogWriter},
+	logging::{init_log_logger, validate_log_entry, TestLogWriter},
 	open_channel, premine_and_distribute_funds, random_config, setup_bitcoind_and_electrsd,
 	setup_builder, setup_node, setup_two_nodes, wait_for_tx, TestChainSource, TestSyncStore,
 };
@@ -18,7 +18,6 @@ use common::{
 use ldk_node::config::EsploraSyncConfig;
 use ldk_node::liquidity::LSPS2ServiceConfig;
 
-use ldk_node::logger::LogLevel;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
 	SendingParameters,
@@ -1156,7 +1155,7 @@ fn facade_logging() {
 
 	let logger = init_log_logger(LevelFilter::Trace);
 	let mut config = random_config(false);
-	config.log_writer = TestLogWriter::LogFacade(LogLevel::Gossip);
+	config.log_writer = TestLogWriter::LogFacade;
 
 	println!("== Facade logging starts ==");
 	let _node = setup_node(&chain_source, config, None);

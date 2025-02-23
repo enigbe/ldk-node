@@ -328,8 +328,8 @@ pub(crate) fn setup_node(
 		TestLogWriter::FileWriter => {
 			builder.set_filesystem_logger(None, None);
 		},
-		TestLogWriter::LogFacade(max_log_level) => {
-			builder.set_log_facade_logger(Some(*max_log_level));
+		TestLogWriter::LogFacade => {
+			builder.set_log_facade_logger();
 		},
 		TestLogWriter::Custom(custom_log_writer) => {
 			builder.set_custom_logger(Arc::clone(custom_log_writer));
