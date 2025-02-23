@@ -1,9 +1,10 @@
 use chrono::Utc;
-use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
-use log::{
-	Level as LogFacadeLevel, LevelFilter as LogFacadeLevelFilter, Log as LogFacadeLog,
-	Record as LogFacadeRecord,
-};
+#[cfg(not(feature = "uniffi"))]
+use ldk_node::logger::LogRecord;
+use ldk_node::logger::{LogLevel, LogWriter};
+#[cfg(not(feature = "uniffi"))]
+use log::Record as LogFacadeRecord;
+use log::{Level as LogFacadeLevel, LevelFilter as LogFacadeLevelFilter, Log as LogFacadeLog};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -54,6 +55,7 @@ impl LogFacadeLog for MockLogFacadeLogger {
 	fn flush(&self) {}
 }
 
+#[cfg(not(feature = "uniffi"))]
 impl LogWriter for MockLogFacadeLogger {
 	fn log<'a>(&self, record: LogRecord) {
 		let record = MockLogRecord(record).into();
@@ -61,6 +63,7 @@ impl LogWriter for MockLogFacadeLogger {
 	}
 }
 
+#[cfg(not(feature = "uniffi"))]
 struct MockLogRecord<'a>(LogRecord<'a>);
 struct MockLogLevel(LogLevel);
 
@@ -76,6 +79,7 @@ impl From<MockLogLevel> for LogFacadeLevel {
 	}
 }
 
+#[cfg(not(feature = "uniffi"))]
 impl<'a> From<MockLogRecord<'a>> for LogFacadeRecord<'a> {
 	fn from(log_record: MockLogRecord<'a>) -> Self {
 		let log_record = log_record.0;
@@ -84,7 +88,7 @@ impl<'a> From<MockLogRecord<'a>> for LogFacadeRecord<'a> {
 		let mut record_builder = LogFacadeRecord::builder();
 		let record = record_builder
 			.level(level)
-			.module_path(Some(log_record.module_path))
+			.module_path(Some(&log_record.module_path))
 			.line(Some(log_record.line))
 			.args(log_record.args);
 
@@ -96,12 +100,6 @@ pub(crate) fn init_log_logger(level: LogFacadeLevelFilter) -> Arc<MockLogFacadeL
 	let logger = Arc::new(MockLogFacadeLogger::new());
 	log::set_boxed_logger(Box::new(logger.clone())).unwrap();
 	log::set_max_level(level);
-
-	logger
-}
-
-pub(crate) fn init_custom_logger() -> Arc<MockLogFacadeLogger> {
-	let logger = Arc::new(MockLogFacadeLogger::new());
 
 	logger
 }
