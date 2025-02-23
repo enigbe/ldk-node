@@ -16,7 +16,6 @@ use common::{
 };
 
 use ldk_node::config::EsploraSyncConfig;
-use ldk_node::logger::LogLevel;
 use ldk_node::payment::{
 	ConfirmationStatus, PaymentDirection, PaymentKind, PaymentStatus, QrPaymentResult,
 	SendingParameters,
@@ -1049,7 +1048,7 @@ fn facade_logging() {
 
 	let logger = init_log_logger(LevelFilter::Trace);
 	let mut config = random_config(false);
-	config.log_writer = TestLogWriter::LogFacade(LogLevel::Gossip);
+	config.log_writer = TestLogWriter::LogFacade;
 
 	println!("== Facade logging starts ==");
 	let _node = setup_node(&chain_source, config, None);

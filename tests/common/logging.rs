@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub(crate) enum TestLogWriter {
 	FileWriter,
-	LogFacade(LogLevel),
+	LogFacade,
 	Custom(Arc<dyn LogWriter>),
 }
 
