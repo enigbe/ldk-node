@@ -81,9 +81,24 @@ const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
 const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
 #[derive(Debug, Clone)]
+enum BitcoindApi {
+	Rpc {
+		rpc_host: String,
+		rpc_port: u16,
+		rpc_user: String,
+		rpc_password: String,
+	},
+	#[allow(dead_code)] // todo(enigbe): remove after these fields are used.
+	Rest {
+		rest_host: String,
+		rest_port: u16,
+	},
+}
+
+#[derive(Debug, Clone)]
 enum ChainDataSourceConfig {
 	Esplora { server_url: String, sync_config: Option<EsploraSyncConfig> },
-	BitcoindRpc { rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String },
+	Bitcoind(BitcoindApi),
 }
 
 #[derive(Debug, Clone)]
@@ -289,8 +304,22 @@ impl NodeBuilder {
 	pub fn set_chain_source_bitcoind_rpc(
 		&mut self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
 	) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rpc {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+		}));
+		self
+	}
+
+	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core REST
+	/// endpoint.
+	pub fn set_chain_source_bitcoind_rest(
+		&mut self, rest_host: String, rest_port: u16,
+	) -> &mut Self {
 		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::BitcoindRpc { rpc_host, rpc_port, rpc_user, rpc_password });
+			Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rest { rest_host, rest_port }));
 		self
 	}
 
@@ -704,6 +733,12 @@ impl ArcedNodeBuilder {
 		);
 	}
 
+	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core REST
+	/// endpoint.
+	pub fn set_chain_source_bitcoind_rest(&self, rest_host: String, rest_port: u16) {
+		self.inner.write().unwrap().set_chain_source_bitcoind_rest(rest_host, rest_port);
+	}
+
 	/// Configures the [`Node`] instance to source its gossip data from the Lightning peer-to-peer
 	/// network.
 	pub fn set_gossip_source_p2p(&self) {
@@ -1024,20 +1059,26 @@ fn build_with_store_internal(
 				Arc::clone(&node_metrics),
 			))
 		},
-		Some(ChainDataSourceConfig::BitcoindRpc { rpc_host, rpc_port, rpc_user, rpc_password }) => {
-			Arc::new(ChainSource::new_bitcoind_rpc(
-				rpc_host.clone(),
-				*rpc_port,
-				rpc_user.clone(),
-				rpc_password.clone(),
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			))
+		Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rpc {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+		})) => Arc::new(ChainSource::new_bitcoind_rpc(
+			rpc_host.clone(),
+			*rpc_port,
+			rpc_user.clone(),
+			rpc_password.clone(),
+			Arc::clone(&wallet),
+			Arc::clone(&fee_estimator),
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&kv_store),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
+		)),
+		Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rest { rest_host: _, rest_port: _ })) => {
+			todo!("create chain source to source from bitcoind rest.")
 		},
 		None => {
 			// Default to Esplora client.
