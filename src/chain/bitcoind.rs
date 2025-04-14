@@ -9,9 +9,11 @@ use crate::types::{ChainMonitor, ChannelManager, Sweeper, Wallet};
 
 use lightning::chain::Listen;
 
+use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::http::HttpEndpoint;
 use lightning_block_sync::http::JsonResponse;
 use lightning_block_sync::poll::ValidatedBlockHeader;
+use lightning_block_sync::rest::RestClient;
 use lightning_block_sync::rpc::{RpcClient, RpcError};
 use lightning_block_sync::{
 	AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource, Cache,
@@ -27,36 +29,121 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub struct BitcoindRpcClient {
-	rpc_client: Arc<RpcClient>,
+pub(crate) enum BitcoindApiClient {
+	Rpc(RpcClient),
+	Rest(RestClient),
+}
+
+impl UtxoSource for BitcoindApiClient {
+	fn get_block_hash_by_height<'a>(
+		&'a self, block_height: u32,
+	) -> AsyncBlockSourceResult<'a, BlockHash> {
+		match self {
+			BitcoindApiClient::Rpc(rpc_client) => rpc_client.get_block_hash_by_height(block_height),
+			BitcoindApiClient::Rest(rest_client) => {
+				rest_client.get_block_hash_by_height(block_height)
+			},
+		}
+	}
+
+	fn is_output_unspent<'a>(
+		&'a self, outpoint: bitcoin::OutPoint,
+	) -> AsyncBlockSourceResult<'a, bool> {
+		match self {
+			BitcoindApiClient::Rpc(rpc_client) => rpc_client.is_output_unspent(outpoint),
+			BitcoindApiClient::Rest(rest_client) => rest_client.is_output_unspent(outpoint),
+		}
+	}
+}
+
+impl BlockSource for BitcoindApiClient {
+	fn get_header<'a>(
+		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
+	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
+		match self {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_header(header_hash, height_hint).await })
+			},
+			BitcoindApiClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_header(header_hash, height_hint).await })
+			},
+		}
+	}
+
+	fn get_block<'a>(
+		&'a self, header_hash: &'a BlockHash,
+	) -> AsyncBlockSourceResult<'a, BlockData> {
+		match self {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_block(header_hash).await })
+			},
+			BitcoindApiClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_block(header_hash).await })
+			},
+		}
+	}
+
+	fn get_best_block(&self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
+		match self {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_best_block().await })
+			},
+			BitcoindApiClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_best_block().await })
+			},
+		}
+	}
+}
+
+pub struct BitcoindClient {
+	api_client: Arc<BitcoindApiClient>,
 	latest_mempool_timestamp: AtomicU64,
 	mempool_entries_cache: tokio::sync::Mutex<HashMap<Txid, MempoolEntry>>,
 	mempool_txs_cache: tokio::sync::Mutex<HashMap<Txid, (Transaction, u64)>>,
 }
 
-impl BitcoindRpcClient {
-	pub(crate) fn new(host: String, port: u16, rpc_user: String, rpc_password: String) -> Self {
+impl BitcoindClient {
+	pub(crate) fn new_rpc(host: String, port: u16, rpc_user: String, rpc_password: String) -> Self {
 		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
 		let rpc_credentials =
 			BASE64_STANDARD.encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
 
-		let rpc_client = Arc::new(RpcClient::new(&rpc_credentials, http_endpoint));
+		let api_client =
+			Arc::new(BitcoindApiClient::Rpc(RpcClient::new(&rpc_credentials, http_endpoint)));
 
 		let latest_mempool_timestamp = AtomicU64::new(0);
 
 		let mempool_entries_cache = tokio::sync::Mutex::new(HashMap::new());
 		let mempool_txs_cache = tokio::sync::Mutex::new(HashMap::new());
-		Self { rpc_client, latest_mempool_timestamp, mempool_entries_cache, mempool_txs_cache }
+		Self { api_client, latest_mempool_timestamp, mempool_entries_cache, mempool_txs_cache }
 	}
 
-	pub(crate) fn rpc_client(&self) -> Arc<RpcClient> {
-		Arc::clone(&self.rpc_client)
+	/// Creates a new bitcoind client for Bitcoin Core's REST API.
+	pub(crate) fn new_rest(host: String, port: u16) -> Self {
+		let http_endpoint = HttpEndpoint::for_host(host).with_port(port);
+		let api_client = Arc::new(BitcoindApiClient::Rest(RestClient::new(http_endpoint)));
+
+		let latest_mempool_timestamp = AtomicU64::new(0);
+
+		let mempool_entries_cache = tokio::sync::Mutex::new(HashMap::new());
+		let mempool_txs_cache = tokio::sync::Mutex::new(HashMap::new());
+		Self { api_client, latest_mempool_timestamp, mempool_entries_cache, mempool_txs_cache }
+	}
+
+	pub(crate) fn api_client(&self) -> Arc<BitcoindApiClient> {
+		Arc::clone(&self.api_client)
 	}
 
 	pub(crate) async fn broadcast_transaction(&self, tx: &Transaction) -> std::io::Result<Txid> {
 		let tx_serialized = bitcoin::consensus::encode::serialize_hex(tx);
 		let tx_json = serde_json::json!(tx_serialized);
-		self.rpc_client.call_method::<Txid>("sendrawtransaction", &[tx_json]).await
+
+		match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				rpc_client.call_method::<Txid>("sendrawtransaction", &[tx_json]).await
+			},
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		}
 	}
 
 	pub(crate) async fn get_fee_estimate_for_target(
@@ -64,20 +151,27 @@ impl BitcoindRpcClient {
 	) -> std::io::Result<FeeRate> {
 		let num_blocks_json = serde_json::json!(num_blocks);
 		let estimation_mode_json = serde_json::json!(estimation_mode);
-		self.rpc_client
-			.call_method::<FeeResponse>(
-				"estimatesmartfee",
-				&[num_blocks_json, estimation_mode_json],
-			)
-			.await
-			.map(|resp| resp.0)
+
+		match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => rpc_client
+				.call_method::<FeeResponse>(
+					"estimatesmartfee",
+					&[num_blocks_json, estimation_mode_json],
+				)
+				.await
+				.map(|resp| resp.0),
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		}
 	}
 
 	pub(crate) async fn get_mempool_minimum_fee_rate(&self) -> std::io::Result<FeeRate> {
-		self.rpc_client
-			.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
-			.await
-			.map(|resp| resp.0)
+		match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => rpc_client
+				.call_method::<MempoolMinFeeResponse>("getmempoolinfo", &[])
+				.await
+				.map(|resp| resp.0),
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		}
 	}
 
 	pub(crate) async fn get_raw_transaction(
@@ -85,11 +179,17 @@ impl BitcoindRpcClient {
 	) -> std::io::Result<Option<Transaction>> {
 		let txid_hex = bitcoin::consensus::encode::serialize_hex(txid);
 		let txid_json = serde_json::json!(txid_hex);
-		match self
-			.rpc_client
-			.call_method::<GetRawTransactionResponse>("getrawtransaction", &[txid_json])
-			.await
-		{
+
+		let get_raw_tx_res = match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				rpc_client
+					.call_method::<GetRawTransactionResponse>("getrawtransaction", &[txid_json])
+					.await
+			},
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		};
+
+		match get_raw_tx_res {
 			Ok(resp) => Ok(Some(resp.0)),
 			Err(e) => match e.into_inner() {
 				Some(inner) => {
@@ -120,10 +220,14 @@ impl BitcoindRpcClient {
 
 	pub(crate) async fn get_raw_mempool(&self) -> std::io::Result<Vec<Txid>> {
 		let verbose_flag_json = serde_json::json!(false);
-		self.rpc_client
-			.call_method::<GetRawMempoolResponse>("getrawmempool", &[verbose_flag_json])
-			.await
-			.map(|resp| resp.0)
+
+		match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => rpc_client
+				.call_method::<GetRawMempoolResponse>("getrawmempool", &[verbose_flag_json])
+				.await
+				.map(|resp| resp.0),
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		}
 	}
 
 	pub(crate) async fn get_mempool_entry(
@@ -131,11 +235,17 @@ impl BitcoindRpcClient {
 	) -> std::io::Result<Option<MempoolEntry>> {
 		let txid_hex = bitcoin::consensus::encode::serialize_hex(&txid);
 		let txid_json = serde_json::json!(txid_hex);
-		match self
-			.rpc_client
-			.call_method::<GetMempoolEntryResponse>("getmempoolentry", &[txid_json])
-			.await
-		{
+
+		let get_mempool_entry_res = match self.api_client.as_ref() {
+			BitcoindApiClient::Rpc(rpc_client) => {
+				rpc_client
+					.call_method::<GetMempoolEntryResponse>("getmempoolentry", &[txid_json])
+					.await
+			},
+			BitcoindApiClient::Rest(_rest_client) => todo!(),
+		};
+
+		match get_mempool_entry_res {
 			Ok(resp) => Ok(Some(MempoolEntry { txid, height: resp.height, time: resp.time })),
 			Err(e) => match e.into_inner() {
 				Some(inner) => {
@@ -254,21 +364,21 @@ impl BitcoindRpcClient {
 	}
 }
 
-impl BlockSource for BitcoindRpcClient {
+impl BlockSource for BitcoindClient {
 	fn get_header<'a>(
 		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
 	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
-		Box::pin(async move { self.rpc_client.get_header(header_hash, height_hint).await })
+		self.api_client.get_header(header_hash, height_hint)
 	}
 
 	fn get_block<'a>(
 		&'a self, header_hash: &'a BlockHash,
 	) -> AsyncBlockSourceResult<'a, BlockData> {
-		Box::pin(async move { self.rpc_client.get_block(header_hash).await })
+		self.api_client.get_block(header_hash)
 	}
 
 	fn get_best_block(&self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
-		Box::pin(async move { self.rpc_client.get_best_block().await })
+		self.api_client.get_best_block()
 	}
 }
 

@@ -5,10 +5,10 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-mod bitcoind_rpc;
+mod bitcoind;
 
-use crate::chain::bitcoind_rpc::{
-	BitcoindRpcClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
+use crate::chain::bitcoind::{
+	BitcoindClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
 };
 use crate::config::{
 	Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP,
@@ -122,8 +122,8 @@ pub(crate) enum ChainSource {
 		logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	},
-	BitcoindRpc {
-		bitcoind_rpc_client: Arc<BitcoindRpcClient>,
+	Bitcoind {
+		bitcoind_client: Arc<BitcoindClient>,
 		header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
 		latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
 		onchain_wallet: Arc<Wallet>,
@@ -173,13 +173,38 @@ impl ChainSource {
 		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
-		let bitcoind_rpc_client =
-			Arc::new(BitcoindRpcClient::new(host, port, rpc_user, rpc_password));
+		let bitcoind_client = Arc::new(BitcoindClient::new_rpc(host, port, rpc_user, rpc_password));
 		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
 		let latest_chain_tip = RwLock::new(None);
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
-		Self::BitcoindRpc {
-			bitcoind_rpc_client,
+		Self::Bitcoind {
+			bitcoind_client,
+			header_cache,
+			latest_chain_tip,
+			onchain_wallet,
+			wallet_polling_status,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			config,
+			logger,
+			node_metrics,
+		}
+	}
+
+	/// Creates a chain source fetching chain data via Bitcoin Core's REST API.
+	pub(crate) fn new_bitcoind_rest(
+		host: String, port: u16, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let bitcoind_client = Arc::new(BitcoindClient::new_rest(host, port));
+		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
+		let latest_chain_tip = RwLock::new(None);
+		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
+		Self::Bitcoind {
+			bitcoind_client,
 			header_cache,
 			latest_chain_tip,
 			onchain_wallet,
@@ -195,7 +220,7 @@ impl ChainSource {
 
 	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
 		match self {
-			Self::BitcoindRpc { bitcoind_rpc_client, .. } => Some(bitcoind_rpc_client.rpc_client()),
+			Self::Bitcoind { bitcoind_client, .. } => Some(bitcoind_client.api_client()),
 			_ => None,
 		}
 	}
@@ -271,8 +296,8 @@ impl ChainSource {
 					return;
 				}
 			},
-			Self::BitcoindRpc {
-				bitcoind_rpc_client,
+			Self::Bitcoind {
+				bitcoind_client,
 				header_cache,
 				latest_chain_tip,
 				onchain_wallet,
@@ -338,7 +363,7 @@ impl ChainSource {
 					let mut locked_header_cache = header_cache.lock().await;
 					let now = SystemTime::now();
 					match synchronize_listeners(
-						bitcoind_rpc_client.as_ref(),
+						bitcoind_client.as_ref(),
 						config.network,
 						&mut *locked_header_cache,
 						chain_listeners.clone(),
@@ -538,7 +563,7 @@ impl ChainSource {
 
 				res
 			},
-			Self::BitcoindRpc { .. } => {
+			Self::Bitcoind { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Onchain wallet will be synced via chain polling")
@@ -637,7 +662,7 @@ impl ChainSource {
 
 				res
 			},
-			Self::BitcoindRpc { .. } => {
+			Self::Bitcoind { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Lightning wallet will be synced via chain polling")
@@ -655,8 +680,8 @@ impl ChainSource {
 				// `sync_onchain_wallet` and `sync_lightning_wallet`. So nothing to do here.
 				unreachable!("Listeners will be synced via transction-based syncing")
 			},
-			Self::BitcoindRpc {
-				bitcoind_rpc_client,
+			Self::Bitcoind {
+				bitcoind_client,
 				header_cache,
 				latest_chain_tip,
 				onchain_wallet,
@@ -685,7 +710,7 @@ impl ChainSource {
 				let chain_tip = if let Some(tip) = latest_chain_tip_opt {
 					tip
 				} else {
-					match validate_best_block_header(bitcoind_rpc_client.as_ref()).await {
+					match validate_best_block_header(bitcoind_client.as_ref()).await {
 						Ok(tip) => {
 							*latest_chain_tip.write().unwrap() = Some(tip);
 							tip
@@ -703,8 +728,7 @@ impl ChainSource {
 				};
 
 				let mut locked_header_cache = header_cache.lock().await;
-				let chain_poller =
-					ChainPoller::new(Arc::clone(&bitcoind_rpc_client), config.network);
+				let chain_poller = ChainPoller::new(Arc::clone(&bitcoind_client), config.network);
 				let chain_listener = ChainListener {
 					onchain_wallet: Arc::clone(&onchain_wallet),
 					channel_manager: Arc::clone(&channel_manager),
@@ -740,7 +764,7 @@ impl ChainSource {
 				let cur_height = channel_manager.current_best_block().height;
 
 				let now = SystemTime::now();
-				match bitcoind_rpc_client
+				match bitcoind_client
 					.get_mempool_transactions_and_timestamp_at_height(cur_height)
 					.await
 				{
@@ -875,8 +899,8 @@ impl ChainSource {
 
 				Ok(())
 			},
-			Self::BitcoindRpc {
-				bitcoind_rpc_client,
+			Self::Bitcoind {
+				bitcoind_client,
 				fee_estimator,
 				config,
 				kv_store,
@@ -907,7 +931,7 @@ impl ChainSource {
 						ConfirmationTarget::Lightning(
 							LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
 						) => {
-							let estimation_fut = bitcoind_rpc_client.get_mempool_minimum_fee_rate();
+							let estimation_fut = bitcoind_client.get_mempool_minimum_fee_rate();
 							get_fee_rate_update!(estimation_fut)
 						},
 						ConfirmationTarget::Lightning(
@@ -915,7 +939,7 @@ impl ChainSource {
 						) => {
 							let num_blocks = get_num_block_defaults_for_target(target);
 							let estimation_mode = FeeRateEstimationMode::Conservative;
-							let estimation_fut = bitcoind_rpc_client
+							let estimation_fut = bitcoind_client
 								.get_fee_estimate_for_target(num_blocks, estimation_mode);
 							get_fee_rate_update!(estimation_fut)
 						},
@@ -924,7 +948,7 @@ impl ChainSource {
 						) => {
 							let num_blocks = get_num_block_defaults_for_target(target);
 							let estimation_mode = FeeRateEstimationMode::Conservative;
-							let estimation_fut = bitcoind_rpc_client
+							let estimation_fut = bitcoind_client
 								.get_fee_estimate_for_target(num_blocks, estimation_mode);
 							get_fee_rate_update!(estimation_fut)
 						},
@@ -932,7 +956,7 @@ impl ChainSource {
 							// Otherwise, we default to economical block-target estimate.
 							let num_blocks = get_num_block_defaults_for_target(target);
 							let estimation_mode = FeeRateEstimationMode::Economical;
-							let estimation_fut = bitcoind_rpc_client
+							let estimation_fut = bitcoind_client
 								.get_fee_estimate_for_target(num_blocks, estimation_mode);
 							get_fee_rate_update!(estimation_fut)
 						},
@@ -1085,7 +1109,7 @@ impl ChainSource {
 					}
 				}
 			},
-			Self::BitcoindRpc { bitcoind_rpc_client, tx_broadcaster, logger, .. } => {
+			Self::Bitcoind { bitcoind_client, tx_broadcaster, logger, .. } => {
 				// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
 				// features, we should eventually switch to use `submitpackage` via the
 				// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
@@ -1096,7 +1120,7 @@ impl ChainSource {
 						let txid = tx.compute_txid();
 						let timeout_fut = tokio::time::timeout(
 							Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
-							bitcoind_rpc_client.broadcast_transaction(tx),
+							bitcoind_client.broadcast_transaction(tx),
 						);
 						match timeout_fut.await {
 							Ok(res) => match res {
@@ -1147,13 +1171,13 @@ impl Filter for ChainSource {
 	fn register_tx(&self, txid: &bitcoin::Txid, script_pubkey: &bitcoin::Script) {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_tx(txid, script_pubkey),
-			Self::BitcoindRpc { .. } => (),
+			Self::Bitcoind { .. } => (),
 		}
 	}
 	fn register_output(&self, output: lightning::chain::WatchedOutput) {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_output(output),
-			Self::BitcoindRpc { .. } => (),
+			Self::Bitcoind { .. } => (),
 		}
 	}
 }

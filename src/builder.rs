@@ -1077,8 +1077,18 @@ fn build_with_store_internal(
 			Arc::clone(&logger),
 			Arc::clone(&node_metrics),
 		)),
-		Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rest { rest_host: _, rest_port: _ })) => {
-			todo!("create chain source to source from bitcoind rest.")
+		Some(ChainDataSourceConfig::Bitcoind(BitcoindApi::Rest { rest_host, rest_port })) => {
+			Arc::new(ChainSource::new_bitcoind_rest(
+				rest_host.clone(),
+				*rest_port,
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			))
 		},
 		None => {
 			// Default to Esplora client.

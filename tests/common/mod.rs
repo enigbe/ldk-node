@@ -258,6 +258,7 @@ type TestNode = Node;
 pub(crate) enum TestChainSource<'a> {
 	Esplora(&'a ElectrsD),
 	BitcoindRpc(&'a BitcoinD),
+	BitcoindRest,
 }
 
 #[derive(Clone, Default)]
@@ -320,6 +321,11 @@ pub(crate) fn setup_node(
 			let rpc_user = values.user;
 			let rpc_password = values.password;
 			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+		},
+		TestChainSource::BitcoindRest => {
+			let rest_host = "http://127.0.0.1".to_string;
+			let rest_port = 18443;
+			builder.set_chain_source_bitcoind_rest(rest_host, rest_port)
 		},
 	}
 
