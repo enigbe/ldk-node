@@ -13,10 +13,11 @@ use crate::chain::bitcoind_rpc::{
 };
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::config::{
-	BackgroundSyncConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
-	BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS,
-	LDK_WALLET_SYNC_TIMEOUT_SECS, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
-	TX_BROADCAST_TIMEOUT_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+	BackgroundSyncConfig, BitcoindSyncClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
+	BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
+	FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, LDK_WALLET_SYNC_TIMEOUT_SECS,
+	RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL, TX_BROADCAST_TIMEOUT_SECS,
+	WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
@@ -27,16 +28,19 @@ use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+use bitcoind_rpc::{endpoint, rpc_credentials};
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
 use lightning::util::ser::Writeable;
 
+use lightning_block_sync::rest::RestClient;
+use lightning_block_sync::rpc::RpcClient;
 use lightning_transaction_sync::EsploraSyncClient;
 
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::init::{synchronize_listeners, validate_best_block_header};
 use lightning_block_sync::poll::{ChainPoller, ChainTip, ValidatedBlockHeader};
-use lightning_block_sync::SpvClient;
+use lightning_block_sync::{BlockSource, SpvClient};
 
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::Update as BdkUpdate;
@@ -186,6 +190,46 @@ impl ElectrumRuntimeStatus {
 	}
 }
 
+pub(crate) enum BitcoindSyncClient {
+	Rpc(RpcClient),
+	Rest(RestClient),
+}
+
+impl BlockSource for BitcoindSyncClient {
+	fn get_header<'a>(
+		&'a self, header_hash: &'a bitcoin::BlockHash, height_hint: Option<u32>,
+	) -> lightning_block_sync::AsyncBlockSourceResult<'a, lightning_block_sync::BlockHeaderData> {
+		match self {
+			BitcoindSyncClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_header(header_hash, height_hint).await })
+			},
+			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+		}
+	}
+
+	fn get_block<'a>(
+		&'a self, header_hash: &'a bitcoin::BlockHash,
+	) -> lightning_block_sync::AsyncBlockSourceResult<'a, lightning_block_sync::BlockData> {
+		match self {
+			BitcoindSyncClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_block(header_hash).await })
+			},
+			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+		}
+	}
+
+	fn get_best_block(
+		&self,
+	) -> lightning_block_sync::AsyncBlockSourceResult<(bitcoin::BlockHash, Option<u32>)> {
+		match self {
+			BitcoindSyncClient::Rpc(rpc_client) => {
+				Box::pin(async move { rpc_client.get_best_block().await })
+			},
+			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+		}
+	}
+}
+
 pub(crate) enum ChainSource {
 	Esplora {
 		sync_config: EsploraSyncConfig,
@@ -215,8 +259,9 @@ pub(crate) enum ChainSource {
 		logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	},
-	BitcoindRpc {
+	Bitcoind {
 		bitcoind_rpc_client: Arc<BitcoindRpcClient>,
+		bitcoind_sync_client: Arc<BitcoindSyncClient>,
 		header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
 		latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
 		onchain_wallet: Arc<Wallet>,
@@ -285,19 +330,35 @@ impl ChainSource {
 		}
 	}
 
-	pub(crate) fn new_bitcoind_rpc(
+	pub(crate) fn new_bitcoind(
 		host: String, port: u16, rpc_user: String, rpc_password: String,
 		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
 		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		sync_client_config: BitcoindSyncClientConfig, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
-		let bitcoind_rpc_client =
-			Arc::new(BitcoindRpcClient::new(host, port, rpc_user, rpc_password));
+		let bitcoind_rpc_client = Arc::new(BitcoindRpcClient::new(
+			host.clone(),
+			port.clone(),
+			rpc_user.clone(),
+			rpc_password.clone(),
+		));
+		let bitcoind_sync_client = match sync_client_config {
+			BitcoindSyncClientConfig::Rpc => Arc::new(BitcoindSyncClient::Rpc(RpcClient::new(
+				&rpc_credentials(rpc_user, rpc_password),
+				endpoint(host, port),
+			))),
+			BitcoindSyncClientConfig::Rest { rest_host, rest_port } => {
+				Arc::new(BitcoindSyncClient::Rest(RestClient::new(endpoint(rest_host, rest_port))))
+			},
+		};
+
 		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
 		let latest_chain_tip = RwLock::new(None);
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
-		Self::BitcoindRpc {
+		Self::Bitcoind {
 			bitcoind_rpc_client,
+			bitcoind_sync_client,
 			header_cache,
 			latest_chain_tip,
 			onchain_wallet,
@@ -341,7 +402,7 @@ impl ChainSource {
 
 	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
 		match self {
-			Self::BitcoindRpc { bitcoind_rpc_client, .. } => Some(bitcoind_rpc_client.rpc_client()),
+			Self::Bitcoind { bitcoind_rpc_client, .. } => Some(bitcoind_rpc_client.rpc_client()),
 			_ => None,
 		}
 	}
@@ -392,8 +453,8 @@ impl ChainSource {
 					return;
 				}
 			},
-			Self::BitcoindRpc {
-				bitcoind_rpc_client,
+			Self::Bitcoind {
+				bitcoind_sync_client,
 				header_cache,
 				latest_chain_tip,
 				onchain_wallet,
@@ -459,7 +520,7 @@ impl ChainSource {
 					let mut locked_header_cache = header_cache.lock().await;
 					let now = SystemTime::now();
 					match synchronize_listeners(
-						bitcoind_rpc_client.as_ref(),
+						bitcoind_sync_client.as_ref(),
 						config.network,
 						&mut *locked_header_cache,
 						chain_listeners.clone(),
@@ -810,7 +871,7 @@ impl ChainSource {
 
 				res
 			},
-			Self::BitcoindRpc { .. } => {
+			Self::Bitcoind { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Onchain wallet will be synced via chain polling")
@@ -980,7 +1041,7 @@ impl ChainSource {
 
 				res
 			},
-			Self::BitcoindRpc { .. } => {
+			Self::Bitcoind { .. } => {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Lightning wallet will be synced via chain polling")
@@ -1003,8 +1064,9 @@ impl ChainSource {
 				// `sync_onchain_wallet` and `sync_lightning_wallet`. So nothing to do here.
 				unreachable!("Listeners will be synced via transction-based syncing")
 			},
-			Self::BitcoindRpc {
+			Self::Bitcoind {
 				bitcoind_rpc_client,
+				bitcoind_sync_client,
 				header_cache,
 				latest_chain_tip,
 				onchain_wallet,
@@ -1033,7 +1095,7 @@ impl ChainSource {
 				let chain_tip = if let Some(tip) = latest_chain_tip_opt {
 					tip
 				} else {
-					match validate_best_block_header(bitcoind_rpc_client.as_ref()).await {
+					match validate_best_block_header(bitcoind_sync_client.as_ref()).await {
 						Ok(tip) => {
 							*latest_chain_tip.write().unwrap() = Some(tip);
 							tip
@@ -1052,7 +1114,7 @@ impl ChainSource {
 
 				let mut locked_header_cache = header_cache.lock().await;
 				let chain_poller =
-					ChainPoller::new(Arc::clone(&bitcoind_rpc_client), config.network);
+					ChainPoller::new(Arc::clone(&bitcoind_sync_client), config.network);
 				let chain_listener = ChainListener {
 					onchain_wallet: Arc::clone(&onchain_wallet),
 					channel_manager: Arc::clone(&channel_manager),
@@ -1268,7 +1330,7 @@ impl ChainSource {
 
 				Ok(())
 			},
-			Self::BitcoindRpc {
+			Self::Bitcoind {
 				bitcoind_rpc_client,
 				fee_estimator,
 				config,
@@ -1498,7 +1560,7 @@ impl ChainSource {
 					}
 				}
 			},
-			Self::BitcoindRpc { bitcoind_rpc_client, tx_broadcaster, logger, .. } => {
+			Self::Bitcoind { bitcoind_rpc_client, tx_broadcaster, logger, .. } => {
 				// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
 				// features, we should eventually switch to use `submitpackage` via the
 				// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
@@ -1563,7 +1625,7 @@ impl Filter for ChainSource {
 			Self::Electrum { electrum_runtime_status, .. } => {
 				electrum_runtime_status.write().unwrap().register_tx(txid, script_pubkey)
 			},
-			Self::BitcoindRpc { .. } => (),
+			Self::Bitcoind { .. } => (),
 		}
 	}
 	fn register_output(&self, output: lightning::chain::WatchedOutput) {
@@ -1572,7 +1634,7 @@ impl Filter for ChainSource {
 			Self::Electrum { electrum_runtime_status, .. } => {
 				electrum_runtime_status.write().unwrap().register_output(output)
 			},
-			Self::BitcoindRpc { .. } => (),
+			Self::Bitcoind { .. } => (),
 		}
 	}
 }

@@ -34,6 +34,12 @@ dictionary ElectrumSyncConfig {
 	BackgroundSyncConfig? background_sync_config;
 };
 
+[Enum]
+interface BitcoindSyncClientConfig {
+	Rpc();
+	Rest(string rest_host, u16 rest_port);
+};
+
 dictionary LSPS2ServiceConfig {
 	string? require_token;
 	boolean advertise_service;
@@ -77,7 +83,7 @@ interface Builder {
 	void set_entropy_bip39_mnemonic(Mnemonic mnemonic, string? passphrase);
 	void set_chain_source_esplora(string server_url, EsploraSyncConfig? config);
 	void set_chain_source_electrum(string server_url, ElectrumSyncConfig? config);
-	void set_chain_source_bitcoind_rpc(string rpc_host, u16 rpc_port, string rpc_user, string rpc_password);
+	void set_chain_source_bitcoind(string rpc_host, u16 rpc_port, string rpc_user, string rpc_password, BitcoindSyncClientConfig? sync_client_config);
 	void set_gossip_source_p2p();
 	void set_gossip_source_rgs(string rgs_server_url);
 	void set_liquidity_source_lsps1(PublicKey node_id, SocketAddress address, string? token);

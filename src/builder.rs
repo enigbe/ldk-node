@@ -7,8 +7,9 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_user_config, may_announce_channel, AnnounceError, Config, ElectrumSyncConfig,
-	EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, WALLET_KEYS_SEED_LEN,
+	default_user_config, may_announce_channel, AnnounceError, BitcoindSyncClientConfig, Config,
+	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	WALLET_KEYS_SEED_LEN,
 };
 
 use crate::connection::ConnectionManager;
@@ -82,9 +83,21 @@ const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
 #[derive(Debug, Clone)]
 enum ChainDataSourceConfig {
-	Esplora { server_url: String, sync_config: Option<EsploraSyncConfig> },
-	Electrum { server_url: String, sync_config: Option<ElectrumSyncConfig> },
-	BitcoindRpc { rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String },
+	Esplora {
+		server_url: String,
+		sync_config: Option<EsploraSyncConfig>,
+	},
+	Electrum {
+		server_url: String,
+		sync_config: Option<ElectrumSyncConfig>,
+	},
+	Bitcoind {
+		rpc_host: String,
+		rpc_port: u16,
+		rpc_user: String,
+		rpc_password: String,
+		sync_client_config: BitcoindSyncClientConfig,
+	},
 }
 
 #[derive(Debug, Clone)]
@@ -297,13 +310,26 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core RPC
+	/// Configures the [`Node`] instance to synchronize its chain data from the given Bitcoin Core RPC
 	/// endpoint.
-	pub fn set_chain_source_bitcoind_rpc(
+	///
+	/// This method configures an RPC connection for essential operations, with options for
+	/// synchronization via either RPC (default) or REST.
+	///
+	/// # Parameters:
+	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC connection
+	/// * `sync_client_config` - Optional synchronization client configuration; defaults to using RPC for sync
+	pub fn set_chain_source_bitcoind(
 		&mut self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		sync_client_config: Option<BitcoindSyncClientConfig>,
 	) -> &mut Self {
-		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::BitcoindRpc { rpc_host, rpc_port, rpc_user, rpc_password });
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			sync_client_config: sync_client_config.unwrap_or(BitcoindSyncClientConfig::Rpc),
+		});
 		self
 	}
 
@@ -716,14 +742,16 @@ impl ArcedNodeBuilder {
 
 	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core RPC
 	/// endpoint.
-	pub fn set_chain_source_bitcoind_rpc(
+	pub fn set_chain_source_bitcoind(
 		&self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		sync_client_config: Option<BitcoindSyncClientConfig>,
 	) {
-		self.inner.write().unwrap().set_chain_source_bitcoind_rpc(
+		self.inner.write().unwrap().set_chain_source_bitcoind(
 			rpc_host,
 			rpc_port,
 			rpc_user,
 			rpc_password,
+			sync_client_config,
 		);
 	}
 
@@ -1061,21 +1089,26 @@ fn build_with_store_internal(
 				Arc::clone(&node_metrics),
 			))
 		},
-		Some(ChainDataSourceConfig::BitcoindRpc { rpc_host, rpc_port, rpc_user, rpc_password }) => {
-			Arc::new(ChainSource::new_bitcoind_rpc(
-				rpc_host.clone(),
-				*rpc_port,
-				rpc_user.clone(),
-				rpc_password.clone(),
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			))
-		},
+		Some(ChainDataSourceConfig::Bitcoind {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			sync_client_config,
+		}) => Arc::new(ChainSource::new_bitcoind(
+			rpc_host.clone(),
+			*rpc_port,
+			rpc_user.clone(),
+			rpc_password.clone(),
+			Arc::clone(&wallet),
+			Arc::clone(&fee_estimator),
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&kv_store),
+			Arc::clone(&config),
+			sync_client_config.clone(),
+			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
+		)),
 		None => {
 			// Default to Esplora client.
 			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();

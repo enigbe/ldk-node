@@ -323,7 +323,7 @@ pub(crate) fn setup_node(
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
-			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+			builder.set_chain_source_bitcoind(rpc_host, rpc_port, rpc_user, rpc_password, None);
 		},
 	}
 
