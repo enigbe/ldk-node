@@ -13,9 +13,8 @@ use lightning_block_sync::http::HttpEndpoint;
 use lightning_block_sync::http::JsonResponse;
 use lightning_block_sync::poll::ValidatedBlockHeader;
 use lightning_block_sync::rpc::{RpcClient, RpcError};
-use lightning_block_sync::{
-	AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource, Cache,
-};
+use lightning_block_sync::BlockSource;
+use lightning_block_sync::Cache;
 
 use serde::Serialize;
 
@@ -36,9 +35,8 @@ pub struct BitcoindRpcClient {
 
 impl BitcoindRpcClient {
 	pub(crate) fn new(host: String, port: u16, rpc_user: String, rpc_password: String) -> Self {
-		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
-		let rpc_credentials =
-			BASE64_STANDARD.encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
+		let http_endpoint = endpoint(host, port);
+		let rpc_credentials = rpc_credentials(rpc_user, rpc_password);
 
 		let rpc_client = Arc::new(RpcClient::new(&rpc_credentials, http_endpoint));
 
@@ -283,20 +281,30 @@ impl BitcoindRpcClient {
 	}
 }
 
+pub(crate) fn rpc_credentials(rpc_user: String, rpc_password: String) -> String {
+	BASE64_STANDARD.encode(format!("{}:{}", rpc_user, rpc_password))
+}
+
+pub(crate) fn endpoint(host: String, port: u16) -> HttpEndpoint {
+	HttpEndpoint::for_host(host.clone()).with_port(port)
+}
+
 impl BlockSource for BitcoindRpcClient {
 	fn get_header<'a>(
 		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
-	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
+	) -> lightning_block_sync::AsyncBlockSourceResult<'a, lightning_block_sync::BlockHeaderData> {
 		Box::pin(async move { self.rpc_client.get_header(header_hash, height_hint).await })
 	}
 
 	fn get_block<'a>(
 		&'a self, header_hash: &'a BlockHash,
-	) -> AsyncBlockSourceResult<'a, BlockData> {
+	) -> lightning_block_sync::AsyncBlockSourceResult<'a, lightning_block_sync::BlockData> {
 		Box::pin(async move { self.rpc_client.get_block(header_hash).await })
 	}
 
-	fn get_best_block(&self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
+	fn get_best_block(
+		&self,
+	) -> lightning_block_sync::AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
 		Box::pin(async move { self.rpc_client.get_best_block().await })
 	}
 }
@@ -368,7 +376,8 @@ impl TryInto<GetRawTransactionResponse> for JsonResponse {
 	}
 }
 
-pub struct GetRawMempoolResponse(Vec<Txid>);
+// TODO(@enigbe): undo pub visibility & move to shared module.
+pub struct GetRawMempoolResponse(pub Vec<Txid>);
 
 impl TryInto<GetRawMempoolResponse> for JsonResponse {
 	type Error = std::io::Error;
@@ -405,9 +414,10 @@ impl TryInto<GetRawMempoolResponse> for JsonResponse {
 	}
 }
 
+// TODO(@enigbe): undo pub fields and move to shared module.
 pub struct GetMempoolEntryResponse {
-	time: u64,
-	height: u32,
+	pub time: u64,
+	pub height: u32,
 }
 
 impl TryInto<GetMempoolEntryResponse> for JsonResponse {
@@ -442,14 +452,15 @@ impl TryInto<GetMempoolEntryResponse> for JsonResponse {
 	}
 }
 
+// TODO(@enigbe): undo pub fields and move to shared module.
 #[derive(Debug, Clone)]
 pub(crate) struct MempoolEntry {
 	/// The transaction id
-	txid: Txid,
+	pub txid: Txid,
 	/// Local time transaction entered pool in seconds since 1 Jan 1970 GMT
-	time: u64,
+	pub time: u64,
 	/// Block height when transaction entered pool
-	height: u32,
+	pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
