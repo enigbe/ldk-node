@@ -13,9 +13,7 @@ use lightning_block_sync::http::HttpEndpoint;
 use lightning_block_sync::http::JsonResponse;
 use lightning_block_sync::poll::ValidatedBlockHeader;
 use lightning_block_sync::rpc::{RpcClient, RpcError};
-use lightning_block_sync::{
-	AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource, Cache,
-};
+use lightning_block_sync::Cache;
 
 use serde::Serialize;
 
@@ -36,9 +34,8 @@ pub struct BitcoindRpcClient {
 
 impl BitcoindRpcClient {
 	pub(crate) fn new(host: String, port: u16, rpc_user: String, rpc_password: String) -> Self {
-		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
-		let rpc_credentials =
-			BASE64_STANDARD.encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
+		let http_endpoint = endpoint(host, port);
+		let rpc_credentials = rpc_credentials(rpc_user, rpc_password);
 
 		let rpc_client = Arc::new(RpcClient::new(&rpc_credentials, http_endpoint));
 
@@ -254,22 +251,12 @@ impl BitcoindRpcClient {
 	}
 }
 
-impl BlockSource for BitcoindRpcClient {
-	fn get_header<'a>(
-		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
-	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
-		Box::pin(async move { self.rpc_client.get_header(header_hash, height_hint).await })
-	}
+pub(crate) fn rpc_credentials(rpc_user: String, rpc_password: String) -> String {
+	BASE64_STANDARD.encode(format!("{}:{}", rpc_user, rpc_password))
+}
 
-	fn get_block<'a>(
-		&'a self, header_hash: &'a BlockHash,
-	) -> AsyncBlockSourceResult<'a, BlockData> {
-		Box::pin(async move { self.rpc_client.get_block(header_hash).await })
-	}
-
-	fn get_best_block(&self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
-		Box::pin(async move { self.rpc_client.get_best_block().await })
-	}
+pub(crate) fn endpoint(host: String, port: u16) -> HttpEndpoint {
+	HttpEndpoint::for_host(host.clone()).with_port(port)
 }
 
 pub(crate) struct FeeResponse(pub FeeRate);
