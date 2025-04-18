@@ -12,7 +12,7 @@ pub(crate) mod logging;
 
 use logging::TestLogWriter;
 
-use ldk_node::config::{Config, ElectrumSyncConfig, EsploraSyncConfig};
+use ldk_node::config::{BitcoindSyncClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
@@ -174,6 +174,7 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 		);
 	let mut bitcoind_conf = corepc_node::Conf::default();
 	bitcoind_conf.network = "regtest";
+	bitcoind_conf.args.push("-rest");
 	let bitcoind = BitcoinD::with_conf(bitcoind_exe, &bitcoind_conf).unwrap();
 
 	let electrs_exe = env::var("ELECTRS_EXE")
@@ -256,7 +257,8 @@ type TestNode = Node;
 pub(crate) enum TestChainSource<'a> {
 	Esplora(&'a ElectrsD),
 	Electrum(&'a ElectrsD),
-	BitcoindRpc(&'a BitcoinD),
+	BitcoindRpcSync(&'a BitcoinD),
+	BitcoindRestSync(&'a BitcoinD),
 }
 
 #[derive(Clone, Default)]
@@ -317,13 +319,29 @@ pub(crate) fn setup_node(
 			let sync_config = ElectrumSyncConfig { background_sync_config: None };
 			builder.set_chain_source_electrum(electrum_url.clone(), Some(sync_config));
 		},
-		TestChainSource::BitcoindRpc(bitcoind) => {
+		TestChainSource::BitcoindRpcSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
 			let rpc_port = bitcoind.params.rpc_socket.port();
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
 			builder.set_chain_source_bitcoind(rpc_host, rpc_port, rpc_user, rpc_password, None);
+		},
+		TestChainSource::BitcoindRestSync(bitcoind) => {
+			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
+			let rpc_port = bitcoind.params.rpc_socket.port();
+			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
+			let rpc_user = values.user;
+			let rpc_password = values.password;
+			let sync_client_config =
+				BitcoindSyncClientConfig::Rest { rest_host: rpc_host.clone(), rest_port: rpc_port };
+			builder.set_chain_source_bitcoind(
+				rpc_host,
+				rpc_port,
+				rpc_user,
+				rpc_password,
+				Some(sync_client_config),
+			);
 		},
 	}
 

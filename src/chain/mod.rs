@@ -203,7 +203,9 @@ impl BlockSource for BitcoindSyncClient {
 			BitcoindSyncClient::Rpc(rpc_client) => {
 				Box::pin(async move { rpc_client.get_header(header_hash, height_hint).await })
 			},
-			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+			BitcoindSyncClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_header(header_hash, height_hint).await })
+			},
 		}
 	}
 
@@ -214,7 +216,9 @@ impl BlockSource for BitcoindSyncClient {
 			BitcoindSyncClient::Rpc(rpc_client) => {
 				Box::pin(async move { rpc_client.get_block(header_hash).await })
 			},
-			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+			BitcoindSyncClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_block(header_hash).await })
+			},
 		}
 	}
 
@@ -225,7 +229,9 @@ impl BlockSource for BitcoindSyncClient {
 			BitcoindSyncClient::Rpc(rpc_client) => {
 				Box::pin(async move { rpc_client.get_best_block().await })
 			},
-			BitcoindSyncClient::Rest(_rest_client) => todo!(),
+			BitcoindSyncClient::Rest(rest_client) => {
+				Box::pin(async move { rest_client.get_best_block().await })
+			},
 		}
 	}
 }
@@ -349,7 +355,9 @@ impl ChainSource {
 				endpoint(host, port),
 			))),
 			BitcoindSyncClientConfig::Rest { rest_host, rest_port } => {
-				Arc::new(BitcoindSyncClient::Rest(RestClient::new(endpoint(rest_host, rest_port))))
+				Arc::new(BitcoindSyncClient::Rest(RestClient::new(
+					endpoint(rest_host, rest_port).with_path("/rest".to_string()),
+				)))
 			},
 		};
 
