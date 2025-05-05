@@ -7,7 +7,7 @@
 
 use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
-	default_user_config, may_announce_channel, AnnounceError, BitcoindSyncClientConfig, Config,
+	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
 	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
 	WALLET_KEYS_SEED_LEN,
 };
@@ -96,7 +96,7 @@ enum ChainDataSourceConfig {
 		rpc_port: u16,
 		rpc_user: String,
 		rpc_password: String,
-		sync_client_config: BitcoindSyncClientConfig,
+		rest_client_config: Option<BitcoindRestClientConfig>,
 	},
 }
 
@@ -310,26 +310,48 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to synchronize its chain data from the given Bitcoin Core RPC
-	/// endpoint.
+	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
 	///
-	/// This method configures an RPC connection for essential operations, with options for
-	/// synchronization via either RPC (default) or REST.
+	/// This method establishes an RPC connection that enables all essential chain operations including
+	/// transaction broadcasting and chain data synchronization.
 	///
-	/// # Parameters:
-	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC connection
-	/// * `sync_client_config` - Optional synchronization client configuration; defaults to using RPC for sync
-	pub fn set_chain_source_bitcoind(
+	/// ## Parameters:
+	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
+	///   connection.
+	pub fn set_chain_source_bitcoind_rpc(
 		&mut self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
-		sync_client_config: Option<BitcoindSyncClientConfig>,
 	) -> &mut Self {
 		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
 			rpc_port,
 			rpc_user,
 			rpc_password,
-			sync_client_config: sync_client_config.unwrap_or(BitcoindSyncClientConfig::Rpc),
+			rest_client_config: None,
 		});
+		self
+	}
+
+	/// Configures the [`Node`] instance to synchronize chain data from a Bitcoin Core REST endpoint.
+	///
+	/// This method enables chain data synchronization via Bitcoin Core's REST interface. We pass
+	/// additional RPC configuration to non-REST-supported API calls like transaction broadcasting.
+	///
+	/// ## Parameters:
+	/// * `rest_host`, `rest_port` - Required parameters for the Bitcoin Core REST connection.
+	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
+	///   connection
+	pub fn set_chain_source_bitcoind_rest(
+		&mut self, rest_host: String, rest_port: u16, rpc_host: String, rpc_port: u16,
+		rpc_user: String, rpc_password: String,
+	) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			rest_client_config: Some(BitcoindRestClientConfig { rest_host, rest_port }),
+		});
+
 		self
 	}
 
@@ -740,18 +762,46 @@ impl ArcedNodeBuilder {
 		self.inner.write().unwrap().set_chain_source_electrum(server_url, sync_config);
 	}
 
-	/// Configures the [`Node`] instance to source its chain data from the given Bitcoin Core RPC
-	/// endpoint.
-	pub fn set_chain_source_bitcoind(
+	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
+	///
+	/// This method establishes an RPC connection that enables all essential chain operations including
+	/// transaction broadcasting and chain data synchronization. RPC is the minimum required configuration
+	/// for Bitcoin Core chain interactions and must be set up before any other Bitcoin Core connection options.
+	///
+	/// ## Parameters:
+	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
+	///   connection.
+	pub fn set_chain_source_bitcoind_rpc(
 		&self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
-		sync_client_config: Option<BitcoindSyncClientConfig>,
 	) {
-		self.inner.write().unwrap().set_chain_source_bitcoind(
+		self.inner.write().unwrap().set_chain_source_bitcoind_rpc(
 			rpc_host,
 			rpc_port,
 			rpc_user,
 			rpc_password,
-			sync_client_config,
+		);
+	}
+
+	/// Configures the [`Node`] instance to synchronize chain data from a Bitcoin Core REST endpoint.
+	///
+	/// This method enables chain data synchronization via Bitcoin Core's REST interface.
+	/// It must be called after [`set_chain_source_bitcoind_rpc`] because REST is used only for chain
+	/// synchronization, while RPC is still required for other essential operations like transaction
+	/// broadcasting.
+	///
+	/// ## Parameters:
+	/// * `rest_host`, `rest_port` - Required parameters for the Bitcoin Core REST connection.
+	pub fn set_chain_source_bitcoind_rest(
+		&self, rest_host: String, rest_port: u16, rpc_host: String, rpc_port: u16,
+		rpc_user: String, rpc_password: String,
+	) {
+		self.inner.write().unwrap().set_chain_source_bitcoind_rest(
+			rest_host,
+			rest_port,
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
 		);
 	}
 
@@ -1094,21 +1144,37 @@ fn build_with_store_internal(
 			rpc_port,
 			rpc_user,
 			rpc_password,
-			sync_client_config,
-		}) => Arc::new(ChainSource::new_bitcoind(
-			rpc_host.clone(),
-			*rpc_port,
-			rpc_user.clone(),
-			rpc_password.clone(),
-			Arc::clone(&wallet),
-			Arc::clone(&fee_estimator),
-			Arc::clone(&tx_broadcaster),
-			Arc::clone(&kv_store),
-			Arc::clone(&config),
-			sync_client_config.clone(),
-			Arc::clone(&logger),
-			Arc::clone(&node_metrics),
-		)),
+			rest_client_config,
+		}) => match rest_client_config {
+			Some(rest_client_config) => Arc::new(ChainSource::new_bitcoind_rest(
+				rpc_host.clone(),
+				*rpc_port,
+				rpc_user.clone(),
+				rpc_password.clone(),
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				rest_client_config.clone(),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			)),
+			None => Arc::new(ChainSource::new_bitcoind_rpc(
+				rpc_host.clone(),
+				*rpc_port,
+				rpc_user.clone(),
+				rpc_password.clone(),
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			)),
+		},
+
 		None => {
 			// Default to Esplora client.
 			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();

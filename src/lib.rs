@@ -1273,7 +1273,13 @@ impl Node {
 								.await?;
 							chain_source.sync_onchain_wallet().await?;
 						},
-						ChainSource::Bitcoind { .. } => {
+						ChainSource::BitcoindRpc { .. } => {
+							chain_source.update_fee_rate_estimates().await?;
+							chain_source
+								.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
+								.await?;
+						},
+						ChainSource::BitcoindRest { .. } => {
 							chain_source.update_fee_rate_estimates().await?;
 							chain_source
 								.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
