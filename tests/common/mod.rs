@@ -12,7 +12,7 @@ pub(crate) mod logging;
 
 use logging::TestLogWriter;
 
-use ldk_node::config::{BitcoindSyncClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
+use ldk_node::config::{Config, ElectrumSyncConfig, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
@@ -325,7 +325,7 @@ pub(crate) fn setup_node(
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
-			builder.set_chain_source_bitcoind(rpc_host, rpc_port, rpc_user, rpc_password, None);
+			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
 		},
 		TestChainSource::BitcoindRestSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
@@ -333,14 +333,15 @@ pub(crate) fn setup_node(
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
-			let sync_client_config =
-				BitcoindSyncClientConfig::Rest { rest_host: rpc_host.clone(), rest_port: rpc_port };
-			builder.set_chain_source_bitcoind(
+			let rest_host = bitcoind.params.rpc_socket.ip().to_string();
+			let rest_port = bitcoind.params.rpc_socket.port();
+			builder.set_chain_source_bitcoind_rest(
+				rest_host,
+				rest_port,
 				rpc_host,
 				rpc_port,
 				rpc_user,
 				rpc_password,
-				Some(sync_client_config),
 			);
 		},
 	}
