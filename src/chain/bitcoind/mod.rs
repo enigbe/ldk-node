@@ -180,7 +180,6 @@ impl BitcoindApiClient {
 		macro_rules! get_raw_transaction {
 			(rpc, $rpc_client:expr) => {{
 				let txid_json = serde_json::json!(txid_hex);
-
 				match $rpc_client
 					.call_method::<GetRawTransactionResponse>("getrawtransaction", &[txid_json])
 					.await
@@ -215,10 +214,8 @@ impl BitcoindApiClient {
 					},
 				}
 			}};
-
 			(rest, $rest_client:expr) => {{
 				let tx_path = format!("tx/{}.json", txid_hex);
-
 				match $rest_client
 					.request_resource::<JsonResponse, GetRawTransactionResponse>(&tx_path)
 					.await
@@ -226,20 +223,33 @@ impl BitcoindApiClient {
 					Ok(resp) => Ok(Some(resp.0)),
 					Err(e) => match e.kind() {
 						std::io::ErrorKind::Other => {
-							let http_error_res: Result<Box<HttpError>, _> = e.downcast();
-							match http_error_res {
-								Ok(http_error) => {
-									// Check if it's the HTTP NOT_FOUND error code.
-									if &http_error.status_code == "404" {
-										Ok(None)
-									} else {
-										Err(std::io::Error::new(
-											std::io::ErrorKind::Other,
-											http_error,
-										))
+							match e.into_inner() {
+								Some(inner) => {
+									let http_error_res: Result<Box<HttpError>, _> =
+										inner.downcast();
+									match http_error_res {
+										Ok(http_error) => {
+											// Check if it's the HTTP NOT_FOUND error code.
+											if &http_error.status_code == "404" {
+												Ok(None)
+											} else {
+												Err(std::io::Error::new(
+													std::io::ErrorKind::Other,
+													http_error,
+												))
+											}
+										},
+										Err(_) => {
+											let error_msg =
+												format!("Failed to process {} response.", tx_path);
+											Err(std::io::Error::new(
+												std::io::ErrorKind::Other,
+												error_msg.as_str(),
+											))
+										},
 									}
 								},
-								Err(_) => {
+								None => {
 									let error_msg =
 										format!("Failed to process {} response.", tx_path);
 									Err(std::io::Error::new(
