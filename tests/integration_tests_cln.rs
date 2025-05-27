@@ -86,6 +86,8 @@ fn test_cln() {
 	node.open_channel(cln_node_id, cln_address, funding_amount_sat, Some(500_000_000), None)
 		.unwrap();
 
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+
 	let funding_txo = common::expect_channel_pending_event!(node, cln_node_id);
 	common::wait_for_tx(&electrs_client, funding_txo.txid);
 	common::generate_blocks_and_wait(&bitcoind_client, &electrs_client, 6);
