@@ -29,7 +29,9 @@ pub use lightning::offers::offer::OfferId;
 pub use lightning::routing::gossip::{NodeAlias, NodeId, RoutingFees};
 pub use lightning::util::string::UntrustedString;
 
-pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+pub use lightning_types::payment::{
+	PaymentHash, PaymentPreimage as LdkPaymentPreimage, PaymentSecret,
+};
 
 pub use lightning_invoice::{Description, SignedRawBolt11Invoice};
 
@@ -112,6 +114,15 @@ impl UniffiCustomTypeConverter for Address {
 
 	fn from_custom(obj: Self) -> Self::Builtin {
 		obj.to_string()
+	}
+}
+
+pub struct PaymentPreimage(pub String);
+
+impl From<LdkPaymentPreimage> for PaymentPreimage {
+	fn from(ldk_preimage: LdkPaymentPreimage) -> Self {
+		let inner = hex_utils::to_string(&ldk_preimage.0);
+		Self(inner)
 	}
 }
 
@@ -653,23 +664,23 @@ impl UniffiCustomTypeConverter for PaymentHash {
 	}
 }
 
-impl UniffiCustomTypeConverter for PaymentPreimage {
-	type Builtin = String;
+// impl UniffiCustomTypeConverter for PaymentPreimage {
+// 	type Builtin = String;
 
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
-		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
-			let bytes_res = bytes_vec.try_into();
-			if let Ok(bytes) = bytes_res {
-				return Ok(PaymentPreimage(bytes));
-			}
-		}
-		Err(Error::InvalidPaymentPreimage.into())
-	}
+// 	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+// 		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
+// 			let bytes_res = bytes_vec.try_into();
+// 			if let Ok(bytes) = bytes_res {
+// 				return Ok(PaymentPreimage(bytes));
+// 			}
+// 		}
+// 		Err(Error::InvalidPaymentPreimage.into())
+// 	}
 
-	fn from_custom(obj: Self) -> Self::Builtin {
-		hex_utils::to_string(&obj.0)
-	}
-}
+// 	fn from_custom(obj: Self) -> Self::Builtin {
+// 		hex_utils::to_string(&obj.0)
+// 	}
+// }
 
 impl UniffiCustomTypeConverter for PaymentSecret {
 	type Builtin = String;
