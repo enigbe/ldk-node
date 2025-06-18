@@ -15,7 +15,7 @@ use lightning::{
 	impl_writeable_tlv_based_enum, write_tlv_fields,
 };
 
-use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning_types::payment::{PaymentHash, PaymentSecret};
 
 use bitcoin::{BlockHash, Txid};
 
@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
+use crate::payment::PaymentPreimage;
 
 /// Represents a payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,22 +222,22 @@ impl StorableObject for PaymentDetails {
 				},
 			}
 		}
-		if let Some(preimage_opt) = update.preimage {
+		if let Some(preimage_opt) = &update.preimage {
 			match self.kind {
 				PaymentKind::Bolt11 { ref mut preimage, .. } => {
-					update_if_necessary!(*preimage, preimage_opt)
+					update_if_necessary!(*preimage, preimage_opt.clone())
 				},
 				PaymentKind::Bolt11Jit { ref mut preimage, .. } => {
-					update_if_necessary!(*preimage, preimage_opt)
+					update_if_necessary!(*preimage, preimage_opt.clone())
 				},
 				PaymentKind::Bolt12Offer { ref mut preimage, .. } => {
-					update_if_necessary!(*preimage, preimage_opt)
+					update_if_necessary!(*preimage, preimage_opt.clone())
 				},
 				PaymentKind::Bolt12Refund { ref mut preimage, .. } => {
-					update_if_necessary!(*preimage, preimage_opt)
+					update_if_necessary!(*preimage, preimage_opt.clone())
 				},
 				PaymentKind::Spontaneous { ref mut preimage, .. } => {
-					update_if_necessary!(*preimage, preimage_opt)
+					update_if_necessary!(*preimage, preimage_opt.clone())
 				},
 				_ => {},
 			}
@@ -563,13 +564,17 @@ impl PaymentDetailsUpdate {
 
 impl From<&PaymentDetails> for PaymentDetailsUpdate {
 	fn from(value: &PaymentDetails) -> Self {
-		let (hash, preimage, secret) = match value.kind {
+		let (hash, preimage, secret) = match &value.kind {
 			PaymentKind::Bolt11 { hash, preimage, secret, .. } => (Some(hash), preimage, secret),
 			PaymentKind::Bolt11Jit { hash, preimage, secret, .. } => (Some(hash), preimage, secret),
-			PaymentKind::Bolt12Offer { hash, preimage, secret, .. } => (hash, preimage, secret),
-			PaymentKind::Bolt12Refund { hash, preimage, secret, .. } => (hash, preimage, secret),
-			PaymentKind::Spontaneous { hash, preimage, .. } => (Some(hash), preimage, None),
-			_ => (None, None, None),
+			PaymentKind::Bolt12Offer { hash, preimage, secret, .. } => {
+				(hash.as_ref(), preimage, secret)
+			},
+			PaymentKind::Bolt12Refund { hash, preimage, secret, .. } => {
+				(hash.as_ref(), preimage, secret)
+			},
+			PaymentKind::Spontaneous { hash, preimage, .. } => (Some(hash), preimage, &None),
+			_ => (None, &None, &None),
 		};
 
 		let confirmation_status = match value.kind {
@@ -586,9 +591,9 @@ impl From<&PaymentDetails> for PaymentDetailsUpdate {
 
 		Self {
 			id: value.id,
-			hash: Some(hash),
-			preimage: Some(preimage),
-			secret: Some(secret),
+			hash: Some(hash.copied()),
+			preimage: Some(preimage.clone()),
+			secret: Some(*secret),
 			amount_msat: Some(value.amount_msat),
 			fee_paid_msat: Some(value.fee_paid_msat),
 			counterparty_skimmed_fee_msat,
