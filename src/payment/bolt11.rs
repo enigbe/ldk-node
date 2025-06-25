@@ -13,10 +13,9 @@ use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::error::Error;
-use crate::ffi::{maybe_deref, maybe_try_convert_enum, maybe_wrap, maybe_wrap_arc};
+use crate::ffi::{maybe_deref, maybe_extract, maybe_try_convert_enum, maybe_wrap, maybe_wrap_arc};
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::maybe_extract_inner;
 use crate::payment::store::{
 	LSPFeeLimits, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
 	PaymentStatus,
@@ -36,7 +35,6 @@ use lightning_types::payment::{PaymentHash, PaymentPreimage as LdkPaymentPreimag
 
 use lightning_invoice::Bolt11Invoice as LdkBolt11Invoice;
 use lightning_invoice::Bolt11InvoiceDescription as LdkBolt11InvoiceDescription;
-use lightning_types::payment::PaymentHash;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -349,20 +347,9 @@ impl Bolt11Payment {
 	pub fn claim_for_hash(
 		&self, payment_hash: PaymentHash, claimable_amount_msat: u64, preimage: PaymentPreimage,
 	) -> Result<(), Error> {
-		let payment_preimage = {
-			#[cfg(feature = "uniffi")]
-			{
-				preimage.to_vec().expect("Invalid preimage")
-			}
-			#[cfg(not(feature = "uniffi"))]
-			{
-				preimage.0
-			}
-		};
-
 		let payment_id = PaymentId(payment_hash.0);
 
-		let inner: LdkPaymentPreimage = maybe_extract_inner!(preimage.clone());
+		let inner: LdkPaymentPreimage = maybe_extract(preimage.clone())?;
 		let expected_payment_hash = PaymentHash(Sha256::hash(&inner.0).to_byte_array());
 
 		if expected_payment_hash != payment_hash {
@@ -394,7 +381,7 @@ impl Bolt11Payment {
 			return Err(Error::InvalidPaymentHash);
 		}
 
-		let inner: LdkPaymentPreimage = maybe_extract_inner!(preimage);
+		let inner: LdkPaymentPreimage = maybe_extract(preimage)?;
 		self.channel_manager.claim_funds(inner);
 		Ok(())
 	}

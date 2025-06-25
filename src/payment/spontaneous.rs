@@ -9,9 +9,8 @@
 
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::error::Error;
-use crate::ffi::maybe_wrap;
+use crate::ffi::{maybe_extract, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::maybe_extract_inner;
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use crate::payment::{PaymentPreimage, SendingParameters};
 use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
@@ -76,7 +75,6 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
 		preimage: PaymentPreimage,
 	) -> Result<PaymentId, Error> {
-		// let preimage = convert_preimage(Some(preimage));
 		self.send_inner(amount_msat, node_id, sending_parameters, None, Some(preimage))
 	}
 
@@ -98,7 +96,7 @@ impl SpontaneousPayment {
 		}
 
 		let payment_preimage = if let Some(payment_preimage) = preimage {
-			maybe_extract_inner!(payment_preimage)
+			maybe_extract(payment_preimage)?
 		} else {
 			LdkPaymentPreimage(self.keys_manager.get_secure_random_bytes())
 		};

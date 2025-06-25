@@ -62,11 +62,7 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::offers::invoice::Bolt12Invoice as LdkBolt12Invoice;
 use lightning::offers::offer::{Amount as LdkAmount, Offer as LdkOffer};
 use lightning::offers::refund::Refund as LdkRefund;
-<<<<<<< HEAD
 use lightning::util::ser::{Readable, Writeable};
-=======
-use lightning::util::ser::{Readable, Writeable, Writer};
->>>>>>> c4f363c (bindings proper new type wrapper WIP)
 use lightning_invoice::{Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescriptionRef};
 
 use std::convert::TryInto;
@@ -698,19 +694,6 @@ impl TryFrom<PaymentPreimage> for LdkPaymentPreimage {
 	}
 }
 
-// #[cfg(feature = "uniffi")]
-// impl TryFrom<Option<crate::ffi::PaymentPreimage>>
-// 	for Option<lightning::types::payment::PaymentPreimage>
-// {
-// 	type Error = crate::error::Error;
-
-// 	fn try_from(value: Option<crate::ffi::PaymentPreimage>) -> Result<Self, Self::Error> {
-// 		value
-// 			.map(|p| lightning::types::payment::PaymentPreimage::try_from(p).map(|inner| inner.0))
-// 			.transpose()
-// 	}
-// }
-
 impl FromStr for PaymentPreimage {
 	type Err = Error;
 
@@ -729,7 +712,14 @@ impl Writeable for PaymentPreimage {
 	fn write<W: lightning::util::ser::Writer>(
 		&self, writer: &mut W,
 	) -> Result<(), lightning::io::Error> {
-		Ok(self.inner.write(writer)?)
+		let ldk_preimage = LdkPaymentPreimage::try_from(self.clone()).map_err(|_| {
+			lightning::io::Error::new(
+				lightning::io::ErrorKind::InvalidData,
+				"Invalid payment preimage",
+			)
+		})?;
+
+		ldk_preimage.0.write(writer)
 	}
 }
 
@@ -739,64 +729,6 @@ impl Readable for PaymentPreimage {
 		Ok(PaymentPreimage { inner: buf.to_vec() })
 	}
 }
-
-impl From<LdkPaymentPreimage> for PaymentPreimage {
-	fn from(preimage: LdkPaymentPreimage) -> Self {
-		Self { inner: hex_utils::to_string(&preimage.0) }
-	}
-}
-
-impl From<PaymentPreimage> for LdkPaymentPreimage {
-	fn from(preimage: PaymentPreimage) -> Self {
-		let bytes =
-			hex_utils::to_vec(&preimage.inner).expect("Invalid hex string in PaymentPreimage");
-		let mut array = [0u8; 32];
-		array.copy_from_slice(&bytes[..32]);
-		LdkPaymentPreimage(array)
-	}
-}
-
-impl std::fmt::Display for PaymentPreimage {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.inner)
-	}
-}
-
-impl Writeable for PaymentPreimage {
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
-		writer.write_all(self.inner.as_bytes())?;
-		Ok(())
-	}
-}
-
-impl Readable for PaymentPreimage {
-	fn read<R: lightning::io::Read>(reader: &mut R) -> Result<Self, DecodeError> {
-		let mut buffer = [0u8; 32]; // Expect 32 bytes (64 hex chars when encoded)
-		reader.read_exact(&mut buffer).map_err(|e| DecodeError::from(e))?;
-		let hex_str = hex_utils::to_string(&buffer);
-		Ok(PaymentPreimage { inner: hex_str })
-	}
-}
-
-impl From<&LdkPaymentPreimage> for PaymentPreimage {
-	fn from(preimage: &LdkPaymentPreimage) -> Self {
-		Self { inner: hex_utils::to_string(&preimage.0) }
-	}
-}
-
-
-// impl Deref for PaymentPreimage {
-// 	type Target = LdkPaymentPreimage;
-// 	fn deref(&self) -> &Self::Target {
-// 		&self
-// 	}
-// }
-
-// impl AsRef<LdkPaymentPreimage> for PaymentPreimage {
-// 	fn as_ref(&self) -> &LdkPaymentPreimage {
-// 		self.deref()
-// 	}
-// }
 
 impl UniffiCustomTypeConverter for PaymentSecret {
 	type Builtin = String;

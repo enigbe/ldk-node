@@ -44,7 +44,6 @@ use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning_types::payment::PaymentHash;
 
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
-use lightning_types::payment::PaymentHash;
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
@@ -1487,19 +1486,6 @@ where
 		}
 		Ok(())
 	}
-}
-
-pub fn convert_preimage(
-    preimage: Option<lightning_types::payment::PaymentPreimage>,
-) -> Option<PaymentPreimage> {
-    #[cfg(feature = "uniffi")]
-    {
-        preimage.map(PaymentPreimage::from)
-    }
-    #[cfg(not(feature = "uniffi"))]
-    {
-        preimage
-    }
 }
 
 #[cfg(test)]

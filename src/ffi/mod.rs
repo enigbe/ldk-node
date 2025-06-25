@@ -18,13 +18,12 @@ where
 	wrapped_type.as_ref().as_ref()
 }
 
-/// Extract inner type.
 #[cfg(feature = "uniffi")]
-#[macro_export]
-macro_rules! maybe_extract_inner {
-	($value:expr) => {
-		TryFrom::try_from($value)?
-	};
+pub fn maybe_extract<T, R>(wrapped_type: T) -> Result<R, crate::error::Error>
+where
+	R: TryFrom<T, Error = crate::error::Error>,
+{
+	R::try_from(wrapped_type)
 }
 
 #[cfg(feature = "uniffi")]
@@ -65,24 +64,9 @@ pub fn maybe_wrap<T>(value: T) -> T {
 	value
 }
 
-/// Extract inner type.
 #[cfg(not(feature = "uniffi"))]
-#[macro_export]
-macro_rules! maybe_extract_inner {
-	($value:expr) => {
-		$value
-	};
-}
-
-#[cfg(feature = "uniffi")]
-pub fn maybe_unwrap_option<T, L>(wrapper_option: Option<T>) -> Option<L>
+pub fn maybe_extract<T>(wrapped_type: T) -> Result<T, crate::error::Error>
 where
-	T: TryInto<L>,
 {
-	wrapper_option.and_then(|t| t.try_into().ok())
-}
-
-#[cfg(not(feature = "uniffi"))]
-pub fn maybe_unwrap_option<T>(value: Option<T>) -> Option<T> {
-	value
+	Ok(wrapped_type)
 }

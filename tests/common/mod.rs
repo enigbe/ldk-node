@@ -40,7 +40,6 @@ use electrum_client::ElectrumApi;
 
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use ldk_node::maybe_extract_inner;
 
 use std::env;
 use std::path::PathBuf;

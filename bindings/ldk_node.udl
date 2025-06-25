@@ -810,10 +810,6 @@ interface Bolt12Invoice {
 	sequence<u8> encode();
 };
 
-dictionary PaymentPreimage {
-	string inner;
-};
-
 [Custom]
 typedef string Txid;
 
