@@ -450,6 +450,10 @@ dictionary PaymentDetails {
 	u64 latest_update_timestamp;
 };
 
+dictionary PaymentPreimage {
+	bytes inner;
+};
+
 dictionary SendingParameters {
 	MaxTotalRoutingFeeLimit? max_total_routing_fee_msat;
 	u32? max_total_cltv_expiry_delta;
@@ -806,6 +810,10 @@ interface Bolt12Invoice {
 	sequence<u8> encode();
 };
 
+dictionary PaymentPreimage {
+	string inner;
+};
+
 [Custom]
 typedef string Txid;
 
@@ -832,9 +840,6 @@ typedef string PaymentId;
 
 [Custom]
 typedef string PaymentHash;
-
-[Custom]
-typedef string PaymentPreimage;
 
 [Custom]
 typedef string PaymentSecret;
