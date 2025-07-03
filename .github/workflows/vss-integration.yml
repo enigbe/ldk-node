@@ -61,12 +61,12 @@ jobs:
         run: |
           # Print Info
           java -version
-          GRADLE_VERSION=$(gradle --version | grep "Gradle" | awk '{print $2}')
+          GRADLE_VERSION=$(gradle --version | awk '/^Gradle/ {print $2}' | head -1)
           if [ -z "$GRADLE_VERSION" ]; then
             echo "Failed to extract Gradle version, using default"
-            GRADLE_VERSION="9.0.0-rc-1"
+            GRADLE_VERSION="9.0"
           fi
-          echo $GRADLE_VERSION
+          echo "Gradle $GRADLE_VERSION"
 
           cd vss-server/java
           gradle wrapper --gradle-version $GRADLE_VERSION
