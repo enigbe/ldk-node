@@ -10,15 +10,18 @@
 //
 // Make sure to add any re-exported items that need to be used in uniffi below.
 
+pub use crate::balance::LightningBalance as NodeLightningBalance;
 pub use crate::config::{
 	default_config, AnchorChannelsConfig, BackgroundSyncConfig, ElectrumSyncConfig,
 	EsploraSyncConfig, MaxDustHTLCExposure,
 };
+pub use crate::event::Event as NodeEvent;
 pub use crate::graph::{ChannelInfo, ChannelUpdateInfo, NodeAnnouncementInfo, NodeInfo};
 pub use crate::liquidity::{LSPS1OrderStatus, LSPS2ServiceConfig, OnchainPaymentInfo, PaymentInfo};
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
 pub use crate::payment::store::{
-	ConfirmationStatus, LSPFeeLimits, PaymentDirection, PaymentKind, PaymentStatus,
+	ConfirmationStatus, LSPFeeLimits, PaymentDirection, PaymentKind as NodePaymentKind,
+	PaymentStatus,
 };
 pub use crate::payment::{MaxTotalRoutingFeeLimit, QrPaymentResult, SendingParameters};
 
@@ -29,7 +32,9 @@ pub use lightning::offers::offer::OfferId;
 pub use lightning::routing::gossip::{NodeAlias, NodeId, RoutingFees};
 pub use lightning::util::string::UntrustedString;
 
-pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+pub use lightning_types::payment::{
+	PaymentHash, PaymentPreimage as LdkPaymentPreimage, PaymentSecret,
+};
 
 pub use lightning_invoice::{Description, SignedRawBolt11Invoice};
 
@@ -665,21 +670,650 @@ impl UniffiCustomTypeConverter for PaymentHash {
 	}
 }
 
-impl UniffiCustomTypeConverter for PaymentPreimage {
-	type Builtin = String;
+/// The payment preimage is the "secret key" which is used to claim the funds of an HTLC on-chain
+/// or in a lightning channel.
+#[derive(Hash, Copy, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct PaymentPreimage {
+	pub(crate) inner: LdkPaymentPreimage,
+}
 
-	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
-		if let Some(bytes_vec) = hex_utils::to_vec(&val) {
-			let bytes_res = bytes_vec.try_into();
-			if let Ok(bytes) = bytes_res {
-				return Ok(PaymentPreimage(bytes));
+impl PaymentPreimage {
+	pub fn from_str(preimage_str: &str) -> Result<Self, Error> {
+		preimage_str.parse()
+	}
+}
+
+impl FromStr for PaymentPreimage {
+	type Err = Error;
+
+	fn from_str(preimage_str: &str) -> Result<Self, Self::Err> {
+		if let Some(bytes) = hex_utils::to_vec(preimage_str) {
+			if let Ok(array) = bytes.try_into() {
+				return Ok(Self::from(LdkPaymentPreimage(array)));
 			}
 		}
-		Err(Error::InvalidPaymentPreimage.into())
-	}
 
-	fn from_custom(obj: Self) -> Self::Builtin {
-		hex_utils::to_string(&obj.0)
+		Err(Error::InvalidPaymentPreimage)
+	}
+}
+
+impl From<LdkPaymentPreimage> for PaymentPreimage {
+	fn from(preimage: LdkPaymentPreimage) -> Self {
+		PaymentPreimage { inner: preimage }
+	}
+}
+
+impl std::fmt::Display for PaymentPreimage {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.inner)
+	}
+}
+
+/// Represents the kind of a payment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentKind {
+	Onchain {
+		txid: Txid,
+		status: Arc<ConfirmationStatus>,
+	},
+	Bolt11 {
+		hash: PaymentHash,
+		preimage: Arc<Option<PaymentPreimage>>,
+		secret: Option<PaymentSecret>,
+	},
+	Bolt11Jit {
+		hash: PaymentHash,
+		preimage: Arc<Option<PaymentPreimage>>,
+		secret: Option<PaymentSecret>,
+		counterparty_skimmed_fee_msat: Option<u64>,
+		lsp_fee_limits: LSPFeeLimits,
+	},
+	Bolt12Offer {
+		hash: Option<PaymentHash>,
+		preimage: Arc<Option<PaymentPreimage>>,
+		secret: Option<PaymentSecret>,
+		offer_id: OfferId,
+		payer_note: Option<UntrustedString>,
+		quantity: Option<u64>,
+	},
+	Bolt12Refund {
+		hash: Option<PaymentHash>,
+		preimage: Arc<Option<PaymentPreimage>>,
+		secret: Option<PaymentSecret>,
+		payer_note: Option<UntrustedString>,
+		quantity: Option<u64>,
+	},
+	Spontaneous {
+		hash: PaymentHash,
+		preimage: Arc<Option<PaymentPreimage>>,
+	},
+}
+
+impl From<NodePaymentKind> for PaymentKind {
+	fn from(payment_kind: NodePaymentKind) -> Self {
+		match payment_kind {
+			NodePaymentKind::Onchain { txid, status } => {
+				PaymentKind::Onchain { txid, status: Arc::new(status) }
+			},
+			NodePaymentKind::Bolt11 { hash, preimage, secret } => {
+				PaymentKind::Bolt11 { hash, preimage: Arc::new(preimage), secret }
+			},
+			NodePaymentKind::Bolt11Jit {
+				hash,
+				preimage,
+				secret,
+				counterparty_skimmed_fee_msat,
+				lsp_fee_limits,
+			} => PaymentKind::Bolt11Jit {
+				hash,
+				preimage: Arc::new(preimage),
+				secret,
+				counterparty_skimmed_fee_msat,
+				lsp_fee_limits,
+			},
+			NodePaymentKind::Bolt12Offer {
+				hash,
+				preimage,
+				secret,
+				offer_id,
+				payer_note,
+				quantity,
+			} => PaymentKind::Bolt12Offer {
+				hash,
+				preimage: Arc::new(preimage),
+				secret,
+				offer_id,
+				payer_note,
+				quantity,
+			},
+			NodePaymentKind::Bolt12Refund { hash, preimage, secret, payer_note, quantity } => {
+				PaymentKind::Bolt12Refund {
+					hash,
+					preimage: Arc::new(preimage),
+					secret,
+					payer_note,
+					quantity,
+				}
+			},
+			NodePaymentKind::Spontaneous { hash, preimage } => {
+				PaymentKind::Spontaneous { hash, preimage: Arc::new(preimage) }
+			},
+		}
+	}
+}
+
+impl From<PaymentKind> for NodePaymentKind {
+	fn from(kind: PaymentKind) -> Self {
+		match kind {
+			PaymentKind::Onchain { txid, status } => {
+				NodePaymentKind::Onchain { txid, status: *status }
+			},
+			PaymentKind::Bolt11 { hash, preimage, secret } => {
+				NodePaymentKind::Bolt11 { hash, preimage: *preimage, secret }
+			},
+			PaymentKind::Bolt11Jit {
+				hash,
+				preimage,
+				secret,
+				counterparty_skimmed_fee_msat,
+				lsp_fee_limits,
+			} => NodePaymentKind::Bolt11Jit {
+				hash,
+				preimage: *preimage,
+				secret,
+				counterparty_skimmed_fee_msat,
+				lsp_fee_limits,
+			},
+			PaymentKind::Bolt12Offer { hash, preimage, secret, offer_id, payer_note, quantity } => {
+				NodePaymentKind::Bolt12Offer {
+					hash,
+					preimage: *preimage,
+					secret,
+					offer_id,
+					payer_note,
+					quantity,
+				}
+			},
+			PaymentKind::Bolt12Refund { hash, preimage, secret, payer_note, quantity } => {
+				NodePaymentKind::Bolt12Refund {
+					hash,
+					preimage: *preimage,
+					secret,
+					payer_note,
+					quantity,
+				}
+			},
+			PaymentKind::Spontaneous { hash, preimage } => {
+				NodePaymentKind::Spontaneous { hash, preimage: *preimage }
+			},
+		}
+	}
+}
+
+/// Details about the status of a known Lightning balance.
+#[derive(Debug, Clone)]
+pub enum LightningBalance {
+	ClaimableOnChannelClose {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+		transaction_fee_satoshis: u64,
+		outbound_payment_htlc_rounded_msat: u64,
+		outbound_forwarded_htlc_rounded_msat: u64,
+		inbound_claiming_htlc_rounded_msat: u64,
+		inbound_htlc_rounded_msat: u64,
+	},
+	ClaimableAwaitingConfirmations {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+		confirmation_height: u32,
+		source: BalanceSource,
+	},
+	ContentiousClaimable {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+		timeout_height: u32,
+		payment_hash: PaymentHash,
+		payment_preimage: Arc<PaymentPreimage>,
+	},
+	MaybeTimeoutClaimableHTLC {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+		claimable_height: u32,
+		payment_hash: PaymentHash,
+		outbound_payment: bool,
+	},
+	MaybePreimageClaimableHTLC {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+		expiry_height: u32,
+		payment_hash: PaymentHash,
+	},
+	CounterpartyRevokedOutputClaimable {
+		channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		amount_satoshis: u64,
+	},
+}
+
+impl From<NodeLightningBalance> for LightningBalance {
+	fn from(balance: NodeLightningBalance) -> Self {
+		match balance {
+			NodeLightningBalance::ClaimableOnChannelClose {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				transaction_fee_satoshis,
+				outbound_payment_htlc_rounded_msat,
+				outbound_forwarded_htlc_rounded_msat,
+				inbound_claiming_htlc_rounded_msat,
+				inbound_htlc_rounded_msat,
+			} => LightningBalance::ClaimableOnChannelClose {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				transaction_fee_satoshis,
+				outbound_payment_htlc_rounded_msat,
+				outbound_forwarded_htlc_rounded_msat,
+				inbound_claiming_htlc_rounded_msat,
+				inbound_htlc_rounded_msat,
+			},
+			NodeLightningBalance::ClaimableAwaitingConfirmations {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				confirmation_height,
+				source,
+			} => LightningBalance::ClaimableAwaitingConfirmations {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				confirmation_height,
+				source,
+			},
+			NodeLightningBalance::ContentiousClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				timeout_height,
+				payment_hash,
+				payment_preimage,
+			} => LightningBalance::ContentiousClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				timeout_height,
+				payment_hash,
+				payment_preimage: Arc::new(payment_preimage),
+			},
+			NodeLightningBalance::MaybeTimeoutClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				claimable_height,
+				payment_hash,
+				outbound_payment,
+			} => LightningBalance::MaybeTimeoutClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				claimable_height,
+				payment_hash,
+				outbound_payment,
+			},
+			NodeLightningBalance::MaybePreimageClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				expiry_height,
+				payment_hash,
+			} => LightningBalance::MaybePreimageClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				expiry_height,
+				payment_hash,
+			},
+			NodeLightningBalance::CounterpartyRevokedOutputClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+			} => LightningBalance::CounterpartyRevokedOutputClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+			},
+		}
+	}
+}
+
+impl From<LightningBalance> for NodeLightningBalance {
+	fn from(balance: LightningBalance) -> Self {
+		match balance {
+			LightningBalance::ClaimableOnChannelClose {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				transaction_fee_satoshis,
+				outbound_payment_htlc_rounded_msat,
+				outbound_forwarded_htlc_rounded_msat,
+				inbound_claiming_htlc_rounded_msat,
+				inbound_htlc_rounded_msat,
+			} => NodeLightningBalance::ClaimableOnChannelClose {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				transaction_fee_satoshis,
+				outbound_payment_htlc_rounded_msat,
+				outbound_forwarded_htlc_rounded_msat,
+				inbound_claiming_htlc_rounded_msat,
+				inbound_htlc_rounded_msat,
+			},
+			LightningBalance::ClaimableAwaitingConfirmations {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				confirmation_height,
+				source,
+			} => NodeLightningBalance::ClaimableAwaitingConfirmations {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				confirmation_height,
+				source,
+			},
+			LightningBalance::ContentiousClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				timeout_height,
+				payment_hash,
+				payment_preimage,
+			} => NodeLightningBalance::ContentiousClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				timeout_height,
+				payment_hash,
+				payment_preimage: *payment_preimage,
+			},
+			LightningBalance::MaybeTimeoutClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				claimable_height,
+				payment_hash,
+				outbound_payment,
+			} => NodeLightningBalance::MaybeTimeoutClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				claimable_height,
+				payment_hash,
+				outbound_payment,
+			},
+			LightningBalance::MaybePreimageClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				expiry_height,
+				payment_hash,
+			} => NodeLightningBalance::MaybePreimageClaimableHTLC {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+				expiry_height,
+				payment_hash,
+			},
+			LightningBalance::CounterpartyRevokedOutputClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+			} => NodeLightningBalance::CounterpartyRevokedOutputClaimable {
+				channel_id,
+				counterparty_node_id,
+				amount_satoshis,
+			},
+		}
+	}
+}
+
+/// An event emitted by [`Node`], which should be handled by the user.
+///
+/// [`Node`]: [`crate::Node`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+	PaymentSuccessful {
+		payment_id: Option<PaymentId>,
+		payment_hash: PaymentHash,
+		payment_preimage: Arc<Option<PaymentPreimage>>,
+		fee_paid_msat: Option<u64>,
+	},
+	PaymentFailed {
+		payment_id: Option<PaymentId>,
+		payment_hash: Option<PaymentHash>,
+		reason: Option<PaymentFailureReason>,
+	},
+	PaymentReceived {
+		payment_id: Option<PaymentId>,
+		payment_hash: PaymentHash,
+		amount_msat: u64,
+		custom_records: Vec<CustomTlvRecord>,
+	},
+	PaymentForwarded {
+		prev_channel_id: ChannelId,
+		next_channel_id: ChannelId,
+		prev_user_channel_id: Option<UserChannelId>,
+		next_user_channel_id: Option<UserChannelId>,
+		prev_node_id: Option<PublicKey>,
+		next_node_id: Option<PublicKey>,
+		total_fee_earned_msat: Option<u64>,
+		skimmed_fee_msat: Option<u64>,
+		claim_from_onchain_tx: bool,
+		outbound_amount_forwarded_msat: Option<u64>,
+	},
+	PaymentClaimable {
+		payment_id: PaymentId,
+		payment_hash: PaymentHash,
+		claimable_amount_msat: u64,
+		claim_deadline: Option<u32>,
+		custom_records: Vec<CustomTlvRecord>,
+	},
+	ChannelPending {
+		channel_id: ChannelId,
+		user_channel_id: UserChannelId,
+		former_temporary_channel_id: ChannelId,
+		counterparty_node_id: PublicKey,
+		funding_txo: OutPoint,
+	},
+	ChannelReady {
+		channel_id: ChannelId,
+		user_channel_id: UserChannelId,
+		counterparty_node_id: Option<PublicKey>,
+	},
+	ChannelClosed {
+		channel_id: ChannelId,
+		user_channel_id: UserChannelId,
+		counterparty_node_id: Option<PublicKey>,
+		reason: Arc<Option<ClosureReason>>,
+	},
+}
+
+impl From<NodeEvent> for Event {
+	fn from(event: NodeEvent) -> Self {
+		match event {
+			NodeEvent::PaymentSuccessful {
+				payment_id,
+				payment_hash,
+				payment_preimage,
+				fee_paid_msat,
+			} => Event::PaymentSuccessful {
+				payment_id,
+				payment_hash,
+				payment_preimage: Arc::new(preimage),
+				fee_paid_msat,
+			},
+			NodeEvent::PaymentFailed { payment_id, payment_hash, reason } => {
+				Event::PaymentFailed { payment_id, payment_hash, reason }
+			},
+			NodeEvent::PaymentReceived {
+				payment_id,
+				payment_hash,
+				amount_msat,
+				custom_records,
+			} => Event::PaymentReceived { payment_id, payment_hash, amount_msat, custom_records },
+			NodeEvent::PaymentForwarded {
+				prev_channel_id,
+				next_channel_id,
+				prev_user_channel_id,
+				next_user_channel_id,
+				prev_node_id,
+				next_node_id,
+				total_fee_earned_msat,
+				skimmed_fee_msat,
+				claim_from_onchain_tx,
+				outbound_amount_forwarded_msat,
+			} => Event::PaymentForwarded {
+				prev_channel_id,
+				next_channel_id,
+				prev_user_channel_id,
+				next_user_channel_id,
+				prev_node_id,
+				next_node_id,
+				total_fee_earned_msat,
+				skimmed_fee_msat,
+				claim_from_onchain_tx,
+				outbound_amount_forwarded_msat,
+			},
+			NodeEvent::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				claim_deadline,
+				custom_records,
+			} => Event::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				claim_deadline,
+				custom_records,
+			},
+			NodeEvent::ChannelPending {
+				channel_id,
+				user_channel_id,
+				former_temporary_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			} => Event::ChannelPending {
+				channel_id,
+				user_channel_id,
+				former_temporary_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			},
+			NodeEvent::ChannelReady { channel_id, user_channel_id, counterparty_node_id } => {
+				Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id }
+			},
+			NodeEvent::ChannelClosed {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				reason,
+			} => Event::ChannelClosed {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				reason: Arc::new(reason),
+			},
+		}
+	}
+}
+
+impl From<Event> for NodeEvent {
+	fn from(event: Event) -> Self {
+		match event {
+			Event::PaymentSuccessful {
+				payment_id,
+				payment_hash,
+				payment_preimage,
+				fee_paid_msat,
+			} => NodeEvent::PaymentSuccessful {
+				payment_id,
+				payment_hash,
+				payment_preimage: *payment_preimage,
+				fee_paid_msat,
+			},
+			Event::PaymentFailed { payment_id, payment_hash, reason } => {
+				NodeEvent::PaymentFailed { payment_id, payment_hash, reason }
+			},
+			Event::PaymentReceived { payment_id, payment_hash, amount_msat, custom_records } => {
+				NodeEvent::PaymentReceived { payment_id, payment_hash, amount_msat, custom_records }
+			},
+			Event::PaymentForwarded {
+				prev_channel_id,
+				next_channel_id,
+				prev_user_channel_id,
+				next_user_channel_id,
+				prev_node_id,
+				next_node_id,
+				total_fee_earned_msat,
+				skimmed_fee_msat,
+				claim_from_onchain_tx,
+				outbound_amount_forwarded_msat,
+			} => NodeEvent::PaymentForwarded {
+				prev_channel_id,
+				next_channel_id,
+				prev_user_channel_id,
+				next_user_channel_id,
+				prev_node_id,
+				next_node_id,
+				total_fee_earned_msat,
+				skimmed_fee_msat,
+				claim_from_onchain_tx,
+				outbound_amount_forwarded_msat,
+			},
+			Event::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				claim_deadline,
+				custom_records,
+			} => NodeEvent::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				claim_deadline,
+				custom_records,
+			},
+			Event::ChannelPending {
+				channel_id,
+				user_channel_id,
+				former_temporary_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			} => NodeEvent::ChannelPending {
+				channel_id,
+				user_channel_id,
+				former_temporary_channel_id,
+				counterparty_node_id,
+				funding_txo,
+			},
+			Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id } => {
+				NodeEvent::ChannelReady { channel_id, user_channel_id, counterparty_node_id }
+			},
+			Event::ChannelClosed { channel_id, user_channel_id, counterparty_node_id, reason } => {
+				NodeEvent::ChannelClosed {
+					channel_id,
+					user_channel_id,
+					counterparty_node_id,
+					reason,
+				}
+			},
+		}
 	}
 }
 
