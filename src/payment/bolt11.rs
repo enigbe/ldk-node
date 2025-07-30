@@ -13,7 +13,7 @@ use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::error::Error;
-use crate::ffi::{maybe_deref, maybe_try_convert_enum, maybe_wrap};
+use crate::ffi::{maybe_deref, maybe_try_from, maybe_wrap};
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{
@@ -436,7 +436,7 @@ impl Bolt11Payment {
 	pub fn receive(
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice = self.receive_inner(Some(amount_msat), &description, expiry_secs, None)?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -459,7 +459,7 @@ impl Bolt11Payment {
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 		payment_hash: PaymentHash,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice =
 			self.receive_inner(Some(amount_msat), &description, expiry_secs, Some(payment_hash))?;
 		Ok(maybe_wrap(invoice))
@@ -472,7 +472,7 @@ impl Bolt11Payment {
 	pub fn receive_variable_amount(
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice = self.receive_inner(None, &description, expiry_secs, None)?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -494,7 +494,7 @@ impl Bolt11Payment {
 	pub fn receive_variable_amount_for_hash(
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32, payment_hash: PaymentHash,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice = self.receive_inner(None, &description, expiry_secs, Some(payment_hash))?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -571,7 +571,7 @@ impl Bolt11Payment {
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 		max_total_lsp_fee_limit_msat: Option<u64>,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice = self.receive_via_jit_channel_inner(
 			Some(amount_msat),
 			&description,
@@ -597,7 +597,7 @@ impl Bolt11Payment {
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
 	) -> Result<Bolt11Invoice, Error> {
-		let description = maybe_try_convert_enum(description)?;
+		let description = maybe_try_from(description)?;
 		let invoice = self.receive_via_jit_channel_inner(
 			None,
 			&description,
