@@ -803,6 +803,11 @@ interface Bolt12Invoice {
 	sequence<u8> encode();
 };
 
+interface PaymentPreimage {
+	[Throws=NodeError, Name=from_str]
+	constructor([ByRef] string preimage_str);
+};
+
 [Custom]
 typedef string Txid;
 
@@ -829,9 +834,6 @@ typedef string PaymentId;
 
 [Custom]
 typedef string PaymentHash;
-
-[Custom]
-typedef string PaymentPreimage;
 
 [Custom]
 typedef string PaymentSecret;

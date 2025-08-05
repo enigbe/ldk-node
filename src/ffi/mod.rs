@@ -19,7 +19,7 @@ where
 }
 
 #[cfg(feature = "uniffi")]
-pub fn maybe_try_convert_enum<T, R>(wrapped_type: &T) -> Result<R, crate::error::Error>
+pub fn maybe_try_from<T, R>(wrapped_type: &T) -> Result<R, crate::error::Error>
 where
 	for<'a> R: TryFrom<&'a T, Error = crate::error::Error>,
 {
@@ -37,7 +37,7 @@ pub fn maybe_deref<T>(value: &T) -> &T {
 }
 
 #[cfg(not(feature = "uniffi"))]
-pub fn maybe_try_convert_enum<T>(value: &T) -> Result<&T, crate::error::Error> {
+pub fn maybe_try_from<T>(value: &T) -> Result<&T, crate::error::Error> {
 	Ok(value)
 }
 
