@@ -27,6 +27,7 @@ use lightning::util::persist::{KVStore, KVStoreSync};
 use lightning::util::ser::{Readable, Writeable};
 use prost::Message;
 use rand::RngCore;
+use tracing::{instrument, Instrument};
 use vss_client::client::VssClient;
 use vss_client::error::VssError;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
@@ -42,7 +43,8 @@ use vss_client::util::retry::{
 use vss_client::util::storable_builder::{EntropySource, StorableBuilder};
 
 use crate::entropy::NodeEntropy;
-use crate::io::utils::check_namespace_key_validity;
+use crate::io::utils::{check_namespace_key_validity, classify_entity};
+use crate::tracing::TracingHeaderProvider;
 
 type CustomRetryPolicy = FilteredRetryPolicy<
 	JitteredRetryPolicy<
@@ -135,6 +137,7 @@ impl VssStore {
 		})?;
 
 		let async_retry_policy = retry_policy();
+		let header_provider = Arc::new(TracingHeaderProvider::new(header_provider));
 		let async_client =
 			VssClient::new_with_headers(base_url, async_retry_policy, header_provider);
 
@@ -184,9 +187,12 @@ impl VssStore {
 }
 
 impl KVStoreSync for VssStore {
+	#[instrument(name = "vss.sync.read", skip_all)]
 	fn read(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> io::Result<Vec<u8>> {
+		let parent_span = tracing::Span::current();
+
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -199,14 +205,18 @@ impl KVStoreSync for VssStore {
 		let fut = async move {
 			inner
 				.read_internal(&inner.blocking_client, primary_namespace, secondary_namespace, key)
+				.instrument(parent_span)
 				.await
 		};
 		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
 	}
 
+	#[instrument(name = "vss.sync.write", skip_all)]
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> io::Result<()> {
+		let parent_span = tracing::Span::current();
+
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -230,14 +240,18 @@ impl KVStoreSync for VssStore {
 					key,
 					buf,
 				)
+				.instrument(parent_span)
 				.await
 		};
 		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
 	}
 
+	#[instrument(name = "vss.sync.remove", skip_all)]
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> io::Result<()> {
+		let parent_span = tracing::Span::current();
+
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -260,6 +274,7 @@ impl KVStoreSync for VssStore {
 					secondary_namespace,
 					key,
 				)
+				.instrument(parent_span)
 				.await
 		};
 		if lazy {
@@ -270,7 +285,10 @@ impl KVStoreSync for VssStore {
 		}
 	}
 
+	#[instrument(name = "vss.sync.list", skip_all)]
 	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
+		let parent_span = tracing::Span::current();
+
 		let internal_runtime = self.internal_runtime.as_ref().ok_or_else(|| {
 			debug_assert!(false, "Failed to access internal runtime");
 			let msg = format!("Failed to access internal runtime");
@@ -282,6 +300,7 @@ impl KVStoreSync for VssStore {
 		let fut = async move {
 			inner
 				.list_internal(&inner.blocking_client, primary_namespace, secondary_namespace)
+				.instrument(parent_span)
 				.await
 		};
 		tokio::task::block_in_place(move || internal_runtime.block_on(fut))
@@ -289,6 +308,7 @@ impl KVStoreSync for VssStore {
 }
 
 impl KVStore for VssStore {
+	#[instrument(name = "vss.async.read", skip_all)]
 	fn read(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> impl Future<Output = Result<Vec<u8>, io::Error>> + 'static + Send {
@@ -302,6 +322,8 @@ impl KVStore for VssStore {
 				.await
 		}
 	}
+
+	#[instrument(name = "vss.async.write", skip_all)]
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> impl Future<Output = Result<(), io::Error>> + 'static + Send {
@@ -326,6 +348,8 @@ impl KVStore for VssStore {
 				.await
 		}
 	}
+
+	#[instrument(name = "vss.async.remove", skip_all)]
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> impl Future<Output = Result<(), io::Error>> + 'static + Send {
@@ -357,6 +381,8 @@ impl KVStore for VssStore {
 			}
 		}
 	}
+
+	#[instrument(name = "vss.async.list", skip_all)]
 	fn list(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> impl Future<Output = Result<Vec<String>, io::Error>> + 'static + Send {
@@ -464,6 +490,7 @@ impl VssStoreInner {
 		}
 	}
 
+	#[instrument(name = "vss.list_all_keys", skip(self, client), err)]
 	async fn list_all_keys(
 		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: &str,
 		secondary_namespace: &str,
@@ -495,6 +522,7 @@ impl VssStoreInner {
 		Ok(keys)
 	}
 
+	#[instrument(name = "vss.read_internal", skip(self, client), err)]
 	async fn read_internal(
 		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: String,
 		secondary_namespace: String, key: String,
@@ -531,6 +559,15 @@ impl VssStoreInner {
 		Ok(decrypted)
 	}
 
+	#[instrument(
+		name = "vss.write_internal",
+		skip(self, client, buf, inner_lock_ref),
+		fields(
+        	vss.payload_size_bytes = buf.len(),
+			vss.entity = classify_entity(&primary_namespace, &secondary_namespace, &key)
+		),
+		err
+	)]
 	async fn write_internal(
 		&self, client: &VssClient<CustomRetryPolicy>, inner_lock_ref: Arc<tokio::sync::Mutex<u64>>,
 		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
@@ -575,6 +612,7 @@ impl VssStoreInner {
 		.await
 	}
 
+	#[instrument(name = "vss.remove_internal", skip(self, client, inner_lock_ref), err)]
 	async fn remove_internal(
 		&self, client: &VssClient<CustomRetryPolicy>, inner_lock_ref: Arc<tokio::sync::Mutex<u64>>,
 		locking_key: String, version: u64, primary_namespace: String, secondary_namespace: String,
@@ -608,6 +646,7 @@ impl VssStoreInner {
 		.await
 	}
 
+	#[instrument(name = "vss.list_internal", skip(self, client), err)]
 	async fn list_internal(
 		&self, client: &VssClient<CustomRetryPolicy>, primary_namespace: String,
 		secondary_namespace: String,
@@ -701,6 +740,7 @@ fn retry_policy() -> CustomRetryPolicy {
 		}) as _)
 }
 
+#[instrument(name = "vss.determine_and_write_schema_version", skip(client, key_obfuscator), err)]
 async fn determine_and_write_schema_version(
 	client: &VssClient<CustomRetryPolicy>, store_id: &String, data_encryption_key: [u8; 32],
 	key_obfuscator: &KeyObfuscator,

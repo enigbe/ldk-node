@@ -408,6 +408,56 @@ pub(crate) fn check_namespace_key_validity(
 	Ok(())
 }
 
+pub(crate) fn classify_entity(
+	primary_namespace: &str, secondary_namespace: &str, key: &str,
+) -> &'static str {
+	if !primary_namespace.is_empty() {
+		return match primary_namespace {
+			// LDK-Node
+			"payments" => "payment_info",
+			"bdk_wallet" => match key {
+				"descriptor" => "bdk_wallet.descriptor",
+				"change_descriptor" => "bdk_wallet.change_descriptor",
+				"network" => "bdk_wallet.network",
+				"local_chain" => "bdk_wallet.local_chain",
+				"tx_graph" => "bdk_wallet.tx_graph",
+				"indexer" => "bdk_wallet.indexer",
+				_ => "bdk_wallet.unknown",
+			},
+			"static_invoices" => "static_invoice",
+
+			// LDK
+			"monitors" => "channel_monitor",
+			"monitor_updates" => "channel_monitor_update",
+			"archived_monitors" => "archived_channel_monitor",
+
+			_ => "unknown",
+		};
+	}
+
+	debug_assert!(
+		secondary_namespace.is_empty(),
+		"Unexpected: primary empty but secondary populated: '{}'",
+		secondary_namespace
+	);
+
+	match key {
+		// LDK-Node
+		"events" => "event_queue",
+		"peers" => "peer_info",
+		"node_metrics" => "node_metrics",
+
+		// LDK
+		"manager" => "channel_manager",
+		"network_graph" => "network_graph",
+		"scorer" => "scorer",
+		"external_pathfinding_scores_cache" => "external_pathfinding_scores",
+		"output_sweeper" => "output_sweeper",
+
+		_ => "unknown",
+	}
+}
+
 macro_rules! impl_read_write_change_set_type {
 	(
 		$read_name:ident,

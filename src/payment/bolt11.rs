@@ -21,6 +21,7 @@ use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
+use tracing::instrument;
 
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
@@ -90,10 +91,12 @@ impl Bolt11Payment {
 	///
 	/// If `route_parameters` are provided they will override the default as well as the
 	/// node-wide parameters configured via [`Config::route_parameters`] on a per-field basis.
+	#[instrument(skip(self), ret)]
 	pub fn send(
 		&self, invoice: &Bolt11Invoice, route_parameters: Option<RouteParametersConfig>,
 	) -> Result<PaymentId, Error> {
 		if !*self.is_running.read().unwrap() {
+			log_error!(self.logger, "Payment send failed. Handler not running.");
 			return Err(Error::NotRunning);
 		}
 

@@ -102,6 +102,7 @@ pub mod payment;
 mod peer_store;
 mod runtime;
 mod scoring;
+mod tracing;
 mod tx_broadcaster;
 mod types;
 mod wallet;
@@ -111,6 +112,7 @@ use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub use crate::tracing::{configure_tracer, TracingLogWriter};
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Amount};

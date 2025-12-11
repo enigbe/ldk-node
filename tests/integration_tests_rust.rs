@@ -31,7 +31,7 @@ use ldk_node::payment::{
 	ConfirmationStatus, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 	QrPaymentResult,
 };
-use ldk_node::{Builder, Event, NodeError};
+use ldk_node::{Builder, Event, NodeError, TracingLogWriter};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::routing::gossip::{NodeAlias, NodeId};
 use lightning::routing::router::RouteParametersConfig;
@@ -151,6 +151,8 @@ async fn channel_open_fails_when_funds_insufficient() {
 async fn multi_hop_sending() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	configure_tracer();
+	let tracing_writer = Arc::new(TracingLogWriter {});
 
 	// Setup and fund 5 nodes
 	let mut nodes = Vec::new();
@@ -159,6 +161,7 @@ async fn multi_hop_sending() {
 		let sync_config = EsploraSyncConfig { background_sync_config: None };
 		setup_builder!(builder, config.node_config);
 		builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+		builder.set_custom_logger(tracing_writer);
 		let node = builder.build(config.node_entropy.into()).unwrap();
 		node.start().unwrap();
 		nodes.push(node);
