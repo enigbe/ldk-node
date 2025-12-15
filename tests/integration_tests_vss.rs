@@ -10,9 +10,11 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ldk_node::entropy::NodeEntropy;
 use ldk_node::Builder;
+use ldk_node::{configure_tracer, TracingLogWriter};
 use rand::{rng, Rng};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -20,9 +22,13 @@ async fn channel_full_cycle_with_vss_store() {
 	let (bitcoind, electrsd) = common::setup_bitcoind_and_electrsd();
 	println!("== Node A ==");
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+	configure_tracer();
+	let tracing_writer = Arc::new(TracingLogWriter {});
 	let config_a = common::random_config(true);
 	let mut builder_a = Builder::from_config(config_a.node_config);
 	builder_a.set_chain_source_esplora(esplora_url.clone(), None);
+	builder_a.set_custom_logger(tracing_writer);
 	let vss_base_url = std::env::var("TEST_VSS_BASE_URL").unwrap();
 	let node_a = builder_a
 		.build_with_vss_store_and_fixed_headers(
