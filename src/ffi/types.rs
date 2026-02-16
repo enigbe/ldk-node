@@ -431,6 +431,12 @@ impl KVStoreSync for FfiDynStore {
 	}
 }
 
+impl From<FfiDynStore> for DynStoreWrapper<FfiDynStore> {
+	fn from(ffi_store: FfiDynStore) -> Self {
+		DynStoreWrapper(ffi_store)
+	}
+}
+
 struct FfiDynStoreInner {
 	ffi_store: Arc<dyn FfiDynStoreTrait>,
 	write_version_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<u64>>>>,
