@@ -17,7 +17,7 @@ use lightning::util::persist::{
 	NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE, NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
 	SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 };
-use lightning::{log_debug, log_error, log_warn};
+use lightning::{log_error, log_warn};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
@@ -441,7 +441,7 @@ impl TierStoreInner {
 				Ok(())
 			},
 			Err(e) => {
-				log_debug!(
+				log_error!(
 					self.logger,
 					"Skipping backup write due to primary write failure for key: {}/{}/{}.",
 					primary_namespace,
@@ -483,7 +483,7 @@ impl TierStoreInner {
 				Ok(())
 			},
 			Err(e) => {
-				log_debug!(
+				log_error!(
 					self.logger,
 					"Skipping backup removal due to primary removal failure for key: {}/{}/{}.",
 					primary_namespace,
