@@ -59,9 +59,8 @@ use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{
-	read_event_queue, read_external_pathfinding_scores_from_cache, read_network_graph,
-	read_node_metrics, read_output_sweeper, read_payments, read_peer_info, read_pending_payments,
-	read_scorer,
+	read_all_objects, read_event_queue, read_external_pathfinding_scores_from_cache,
+	read_network_graph, read_node_metrics, read_output_sweeper, read_peer_info, read_scorer,
 };
 use crate::io::vss_store::VssStoreBuilder;
 use crate::io::{
@@ -1279,9 +1278,19 @@ fn build_with_store_internal(
 	let (payment_store_res, node_metris_res, pending_payment_store_res) =
 		runtime.block_on(async move {
 			tokio::join!(
-				read_payments(&*kv_store_ref, Arc::clone(&logger_ref)),
+				read_all_objects(
+					&*kv_store_ref,
+					PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+					PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+					Arc::clone(&logger_ref),
+				),
 				read_node_metrics(&*kv_store_ref, Arc::clone(&logger_ref)),
-				read_pending_payments(&*kv_store_ref, Arc::clone(&logger_ref))
+				read_all_objects(
+					&*kv_store_ref,
+					PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+					PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+					Arc::clone(&logger_ref),
+				)
 			)
 		});
 
