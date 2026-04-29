@@ -781,13 +781,16 @@ where
 
 				let mut config = self.channel_manager.get_current_config().clone();
 
-				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
+				// If we act as an LSPS2 service, the HTLC-value-in-flight must be 100% of the
+				// channel value to ensure we can forward the initial payment. That cap only
+				// applies to unannounced channels, so the channel must also be unannounced.
 				debug_assert_eq!(
 					config
 						.channel_handshake_config
-						.max_inbound_htlc_value_in_flight_percent_of_channel,
+						.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
 					100
 				);
+				debug_assert!(!config.channel_handshake_config.announce_for_forwarding);
 				debug_assert!(config.accept_forwards_to_priv_channels);
 
 				// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
