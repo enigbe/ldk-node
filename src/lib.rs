@@ -122,7 +122,7 @@ use bitcoin::BlockHash;
 pub use bitcoin::FeeRate;
 #[cfg(not(feature = "uniffi"))]
 use bitcoin::FeeRate;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, Network};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
@@ -761,6 +761,7 @@ impl Node {
 	/// Returns the status of the [`Node`].
 	pub fn status(&self) -> NodeStatus {
 		let is_running = *self.is_running.read().expect("lock");
+		let network = self.config.network;
 		let current_best_block = self.channel_manager.current_best_block().into();
 		let locked_node_metrics = self.node_metrics.read().expect("lock");
 		let latest_lightning_wallet_sync_timestamp =
@@ -778,6 +779,7 @@ impl Node {
 
 		NodeStatus {
 			is_running,
+			network,
 			current_best_block,
 			latest_lightning_wallet_sync_timestamp,
 			latest_onchain_wallet_sync_timestamp,
@@ -2079,6 +2081,8 @@ impl From<BlockLocator> for BestBlock {
 pub struct NodeStatus {
 	/// Indicates whether the [`Node`] is running.
 	pub is_running: bool,
+	/// Network (e.g. mainnet, testnet4, signet) on which the [`Node`] is running.
+	pub network: Network,
 	/// The best block to which our Lightning wallet is currently synced.
 	pub current_best_block: BestBlock,
 	/// The timestamp, in seconds since start of the UNIX epoch, when we last successfully synced
