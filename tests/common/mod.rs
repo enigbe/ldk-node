@@ -1543,6 +1543,49 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
 		node_a.sync_wallets().unwrap();
 		node_b.sync_wallets().unwrap();
+	} else {
+		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
+		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
+		let node_a_blocks_to_go = match node_a.list_balances().lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(counterparty_node_id, node_b.node_id());
+				let cur_height = node_a.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				blocks_to_go
+			},
+			_ => panic!("Unexpected balance state!"),
+		};
+
+		assert_eq!(node_b.list_balances().lightning_balances.len(), 1);
+		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
+		let node_b_blocks_to_go = match node_b.list_balances().lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(counterparty_node_id, node_a.node_id());
+				let cur_height = node_b.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				blocks_to_go
+			},
+			_ => panic!("Unexpected balance state!"),
+		};
+
+		assert_eq!(node_a_blocks_to_go, node_b_blocks_to_go);
+
+		generate_blocks_and_wait(&bitcoind, electrsd, node_a_blocks_to_go as usize).await;
+		node_a.sync_wallets().unwrap();
+		node_b.sync_wallets().unwrap();
+
+		assert!(node_a.list_balances().lightning_balances.is_empty());
+		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
+		assert!(node_b.list_balances().lightning_balances.is_empty());
+		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
 	}
 
 	let sum_of_all_payments_sat = (push_msat
