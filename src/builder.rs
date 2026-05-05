@@ -628,6 +628,7 @@ impl NodeBuilder {
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self, node_entropy: NodeEntropy) -> Result<Node, BuildError> {
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 		let storage_dir_path = self.config.storage_dir_path.clone();
 		fs::create_dir_all(storage_dir_path.clone())
 			.map_err(|_| BuildError::StoragePathAccessFailed)?;
@@ -636,20 +637,26 @@ impl NodeBuilder {
 			Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
 			Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
 		)
-		.map_err(|_| BuildError::KVStoreSetupFailed)?;
-		self.build_with_store(node_entropy, kv_store)
+		.map_err(|e| {
+			log_error!(logger, "Failed to setup Sqlite store: {}", e);
+			BuildError::KVStoreSetupFailed
+		})?;
+		self.build_with_store_and_logger(node_entropy, kv_store, logger)
 	}
 
 	/// Builds a [`Node`] instance with a [`FilesystemStore`] backend and according to the options
 	/// previously configured.
 	pub fn build_with_fs_store(&self, node_entropy: NodeEntropy) -> Result<Node, BuildError> {
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 		let mut storage_dir_path: PathBuf = self.config.storage_dir_path.clone().into();
 		storage_dir_path.push("fs_store");
 
-		fs::create_dir_all(storage_dir_path.clone())
-			.map_err(|_| BuildError::StoragePathAccessFailed)?;
+		fs::create_dir_all(storage_dir_path.clone()).map_err(|e| {
+			log_error!(logger, "Failed to setup Filesystem store: {}", e);
+			BuildError::StoragePathAccessFailed
+		})?;
 		let kv_store = FilesystemStore::new(storage_dir_path);
-		self.build_with_store(node_entropy, kv_store)
+		self.build_with_store_and_logger(node_entropy, kv_store, logger)
 	}
 
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
@@ -680,7 +687,7 @@ impl NodeBuilder {
 			BuildError::KVStoreSetupFailed
 		})?;
 
-		self.build_with_store(node_entropy, vss_store)
+		self.build_with_store_and_logger(node_entropy, vss_store, logger)
 	}
 
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
@@ -717,7 +724,7 @@ impl NodeBuilder {
 				BuildError::KVStoreSetupFailed
 			})?;
 
-		self.build_with_store(node_entropy, vss_store)
+		self.build_with_store_and_logger(node_entropy, vss_store, logger)
 	}
 
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
@@ -744,7 +751,7 @@ impl NodeBuilder {
 			BuildError::KVStoreSetupFailed
 		})?;
 
-		self.build_with_store(node_entropy, vss_store)
+		self.build_with_store_and_logger(node_entropy, vss_store, logger)
 	}
 
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
@@ -769,7 +776,7 @@ impl NodeBuilder {
 			BuildError::KVStoreSetupFailed
 		})?;
 
-		self.build_with_store(node_entropy, vss_store)
+		self.build_with_store_and_logger(node_entropy, vss_store, logger)
 	}
 
 	/// Builds a [`Node`] instance according to the options previously configured.
@@ -778,6 +785,12 @@ impl NodeBuilder {
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
 
+		self.build_with_store_and_logger(node_entropy, kv_store, logger)
+	}
+
+	fn build_with_store_and_logger<S: SyncAndAsyncKVStore + Send + Sync + 'static>(
+		&self, node_entropy: NodeEntropy, kv_store: S, logger: Arc<Logger>,
+	) -> Result<Node, BuildError> {
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
