@@ -5,15 +5,24 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-#![cfg(any(test, cln_test, lnd_test, vss_test))]
+#![cfg(any(test, cln_test, lnd_test, eclair_test, vss_test))]
 #![allow(dead_code)]
 
+pub(crate) mod external_node;
 pub(crate) mod logging;
+
+#[cfg(cln_test)]
+pub(crate) mod cln;
+#[cfg(eclair_test)]
+pub(crate) mod eclair;
+#[cfg(lnd_test)]
+pub(crate) mod lnd;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -27,13 +36,16 @@ use bitcoin::{
 use electrsd::corepc_node::{Client as BitcoindClient, Node as BitcoinD};
 use electrsd::{corepc_node, ElectrsD};
 use electrum_client::ElectrumApi;
-use ldk_node::config::{AsyncPaymentsRole, Config, ElectrumSyncConfig, EsploraSyncConfig};
+use ldk_node::config::{
+	AsyncPaymentsRole, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
+	HumanReadableNamesConfig,
+};
 use ldk_node::entropy::{generate_entropy_mnemonic, NodeEntropy};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
-	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
-	UserChannelId,
+	Builder, ChannelShutdownState, CustomTlvRecord, Event, LightningBalance, Node, NodeError,
+	PendingSweepBalance, UserChannelId,
 };
 use lightning::io;
 use lightning::ln::msgs::SocketAddress;
@@ -48,9 +60,24 @@ use rand::distr::Alphanumeric;
 use rand::{rng, Rng};
 use serde_json::{json, Value};
 
+/// Shared timeout (in seconds) for waiting on LDK events and external node operations.
+pub(crate) const INTEROP_TIMEOUT_SECS: u64 = 60;
+
 macro_rules! expect_event {
 	($node:expr, $event_type:ident) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"{} timed out waiting for {} event after 60s",
+				$node.node_id(),
+				std::stringify!($event_type)
+			)
+		});
+		match event {
 			ref e @ Event::$event_type { .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				$node.event_handled().unwrap();
@@ -66,7 +93,15 @@ pub(crate) use expect_event;
 
 macro_rules! expect_channel_pending_event {
 	($node:expr, $counterparty_node_id:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!("{} timed out waiting for ChannelPending event after 60s", $node.node_id())
+		});
+		match event {
 			ref e @ Event::ChannelPending { funding_txo, counterparty_node_id, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(counterparty_node_id, $counterparty_node_id);
@@ -84,7 +119,15 @@ pub(crate) use expect_channel_pending_event;
 
 macro_rules! expect_channel_ready_event {
 	($node:expr, $counterparty_node_id:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!("{} timed out waiting for ChannelReady event after 60s", $node.node_id())
+		});
+		match event {
 			ref e @ Event::ChannelReady { user_channel_id, counterparty_node_id, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(counterparty_node_id, Some($counterparty_node_id));
@@ -104,7 +147,15 @@ macro_rules! expect_channel_ready_events {
 	($node:expr, $counterparty_node_id_a:expr, $counterparty_node_id_b:expr) => {{
 		let mut ids = Vec::new();
 		for _ in 0..2 {
-			match $node.next_event_async().await {
+			let event = tokio::time::timeout(
+				std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+				$node.next_event_async(),
+			)
+			.await
+			.unwrap_or_else(|_| {
+				panic!("{} timed out waiting for ChannelReady event after 60s", $node.node_id())
+			});
+			match event {
 				ref e @ Event::ChannelReady { counterparty_node_id, .. } => {
 					println!("{} got event {:?}", $node.node_id(), e);
 					ids.push(counterparty_node_id);
@@ -130,7 +181,15 @@ pub(crate) use expect_channel_ready_events;
 
 macro_rules! expect_splice_pending_event {
 	($node:expr, $counterparty_node_id:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!("{} timed out waiting for SplicePending event after 60s", $node.node_id())
+		});
+		match event {
 			ref e @ Event::SplicePending { new_funding_txo, counterparty_node_id, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(counterparty_node_id, $counterparty_node_id);
@@ -148,19 +207,27 @@ pub(crate) use expect_splice_pending_event;
 
 macro_rules! expect_payment_received_event {
 	($node:expr, $amount_msat:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!("{} timed out waiting for PaymentReceived event after 60s", $node.node_id())
+		});
+		match event {
 			ref e @ Event::PaymentReceived { payment_id, amount_msat, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(amount_msat, $amount_msat);
 				let payment = $node.payment(&payment_id.unwrap()).unwrap();
-				if !matches!(payment.kind, PaymentKind::Onchain { .. }) {
+				if !matches!(payment.kind, ldk_node::payment::PaymentKind::Onchain { .. }) {
 					assert_eq!(payment.fee_paid_msat, None);
 				}
 				$node.event_handled().unwrap();
 				payment_id
 			},
 			ref e => {
-				panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
+				panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
 			},
 		}
 	}};
@@ -170,7 +237,18 @@ pub(crate) use expect_payment_received_event;
 
 macro_rules! expect_payment_claimable_event {
 	($node:expr, $payment_id:expr, $payment_hash:expr, $claimable_amount_msat:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"{} timed out waiting for PaymentClaimable event after 60s",
+				std::stringify!($node)
+			)
+		});
+		match event {
 			ref e @ Event::PaymentClaimable {
 				payment_id,
 				payment_hash,
@@ -195,7 +273,15 @@ pub(crate) use expect_payment_claimable_event;
 
 macro_rules! expect_payment_successful_event {
 	($node:expr, $payment_id:expr, $fee_paid_msat:expr) => {{
-		match $node.next_event_async().await {
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!("{} timed out waiting for PaymentSuccessful event after 60s", $node.node_id())
+		});
+		match event {
 			ref e @ Event::PaymentSuccessful { payment_id, fee_paid_msat, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				if let Some(fee_msat) = $fee_paid_msat {
@@ -371,14 +457,15 @@ impl Default for TestConfig {
 
 macro_rules! setup_builder {
 	($builder:ident, $config:expr) => {
-		#[cfg(feature = "uniffi")]
-		let $builder = Builder::from_config($config.clone());
-		#[cfg(not(feature = "uniffi"))]
+		#[allow(unused_mut)]
 		let mut $builder = Builder::from_config($config.clone());
 	};
 }
 
 pub(crate) use setup_builder;
+
+#[cfg(any(cln_test, lnd_test, eclair_test))]
+pub(crate) mod scenarios;
 
 pub(crate) fn setup_two_nodes(
 	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
@@ -400,11 +487,27 @@ pub(crate) fn setup_two_nodes_with_store(
 	println!("== Node A ==");
 	let mut config_a = random_config(anchor_channels);
 	config_a.store_type = store_type;
+
+	if cfg!(hrn_tests) {
+		config_a.node_config.hrn_config =
+			HumanReadableNamesConfig { resolution_config: HRNResolverConfig::Blip32 };
+	}
+
 	let node_a = setup_node(chain_source, config_a);
 
 	println!("\n== Node B ==");
 	let mut config_b = random_config(anchor_channels);
 	config_b.store_type = store_type;
+
+	if cfg!(hrn_tests) {
+		config_b.node_config.hrn_config = HumanReadableNamesConfig {
+			resolution_config: HRNResolverConfig::Dns {
+				dns_server_address: SocketAddress::from_str("8.8.8.8:53").unwrap(),
+				enable_hrn_resolution_service: true,
+			},
+		};
+	}
+
 	if allow_0conf {
 		config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
 	}
@@ -422,7 +525,17 @@ pub(crate) fn setup_two_nodes_with_store(
 }
 
 pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> TestNode {
+	setup_node_with_builder(chain_source, config, |_| {})
+}
+
+pub(crate) fn setup_node_with_builder<F>(
+	chain_source: &TestChainSource, config: TestConfig, configure_builder: F,
+) -> TestNode
+where
+	F: FnOnce(&mut Builder),
+{
 	setup_builder!(builder, config.node_config);
+
 	match chain_source {
 		TestChainSource::Esplora(electrsd) => {
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
@@ -481,6 +594,8 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 		builder.set_wallet_recovery_mode();
 	}
 
+	configure_builder(&mut builder);
+
 	let node = match config.store_type {
 		TestStoreType::TestSyncStore => {
 			let kv_store = TestSyncStore::new(config.node_config.storage_dir_path.into());
@@ -488,10 +603,6 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 		},
 		TestStoreType::Sqlite => builder.build(config.node_entropy.into()).unwrap(),
 	};
-
-	if config.recovery_mode {
-		builder.set_wallet_recovery_mode();
-	}
 
 	node.start().unwrap();
 	assert!(node.status().is_running);
@@ -790,7 +901,7 @@ pub async fn splice_in_with_all(
 
 pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	node_a: TestNode, node_b: TestNode, bitcoind: &BitcoindClient, electrsd: &E, allow_0conf: bool,
-	expect_anchor_channel: bool, force_close: bool,
+	disable_node_b_reserve: bool, expect_anchor_channel: bool, force_close: bool,
 ) {
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
@@ -846,15 +957,27 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	println!("\nA -- open_channel -> B");
 	let funding_amount_sat = 2_080_000;
 	let push_msat = (funding_amount_sat / 2) * 1000; // balance the channel
-	node_a
-		.open_announced_channel(
-			node_b.node_id(),
-			node_b.listening_addresses().unwrap().first().unwrap().clone(),
-			funding_amount_sat,
-			Some(push_msat),
-			None,
-		)
-		.unwrap();
+	if disable_node_b_reserve {
+		node_a
+			.open_0reserve_channel(
+				node_b.node_id(),
+				node_b.listening_addresses().unwrap().first().unwrap().clone(),
+				funding_amount_sat,
+				Some(push_msat),
+				None,
+			)
+			.unwrap();
+	} else {
+		node_a
+			.open_announced_channel(
+				node_b.node_id(),
+				node_b.listening_addresses().unwrap().first().unwrap().clone(),
+				funding_amount_sat,
+				Some(push_msat),
+				None,
+			)
+			.unwrap();
+	}
 
 	assert_eq!(node_a.list_peers().first().unwrap().node_id, node_b.node_id());
 	assert!(node_a.list_peers().first().unwrap().is_persisted);
@@ -913,8 +1036,30 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		node_b_anchor_reserve_sat
 	);
 
+	// Note that only node B has 0-reserve, we don't yet have an API to allow the opener of the
+	// channel to have 0-reserve.
+	if disable_node_b_reserve {
+		assert_eq!(node_b.list_channels()[0].unspendable_punishment_reserve, Some(0));
+		assert_eq!(node_b.list_channels()[0].outbound_capacity_msat, push_msat);
+		assert_eq!(node_b.list_channels()[0].next_outbound_htlc_limit_msat, push_msat);
+
+		assert_eq!(node_b.list_balances().total_lightning_balance_sats * 1000, push_msat);
+		let LightningBalance::ClaimableOnChannelClose { amount_satoshis, .. } =
+			node_b.list_balances().lightning_balances[0]
+		else {
+			panic!("Unexpected `LightningBalance` variant");
+		};
+		assert_eq!(amount_satoshis * 1000, push_msat);
+	}
+
 	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
 	let user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// After channel_ready, no shutdown should be in progress.
+	assert!(node_a.list_channels().iter().all(|c| matches!(
+		c.channel_shutdown_state,
+		None | Some(ChannelShutdownState::NotShuttingDown)
+	)));
 
 	println!("\nB receive");
 	let invoice_amount_1_msat = 2500_000;
@@ -1261,12 +1406,59 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		2
 	);
 
+	if disable_node_b_reserve {
+		let node_a_outbound_capacity_msat = node_a.list_channels()[0].outbound_capacity_msat;
+		let node_a_reserve_msat =
+			node_a.list_channels()[0].unspendable_punishment_reserve.unwrap() * 1000;
+		// TODO: Zero-fee commitment channels are anchor channels, but do not allocate any
+		// funds to the anchor, so this will need to be updated when we ship these channels
+		// in ldk-node.
+		let node_a_anchors_msat = if expect_anchor_channel { 2 * 330 * 1000 } else { 0 };
+		let funding_amount_msat = node_a.list_channels()[0].channel_value_sats * 1000;
+		// Node B does not have any reserve, so we only subtract a few items on node A's
+		// side to arrive at node B's capacity
+		let node_b_capacity_msat = funding_amount_msat
+			- node_a_outbound_capacity_msat
+			- node_a_reserve_msat
+			- node_a_anchors_msat;
+		let got_capacity_msat = node_b.list_channels()[0].outbound_capacity_msat;
+		assert_eq!(got_capacity_msat, node_b_capacity_msat);
+		assert_ne!(got_capacity_msat, 0);
+		// Sanity check to make sure this is a non-trivial amount
+		assert!(got_capacity_msat > 15_000_000);
+
+		// This is a private channel, so node B can send 100% of the value over
+		assert_eq!(node_b.list_channels()[0].next_outbound_htlc_limit_msat, node_b_capacity_msat);
+
+		node_b.spontaneous_payment().send(node_b_capacity_msat, node_a.node_id(), None).unwrap();
+		expect_event!(node_b, PaymentSuccessful);
+		expect_event!(node_a, PaymentReceived);
+
+		node_a.spontaneous_payment().send(node_b_capacity_msat, node_b.node_id(), None).unwrap();
+		expect_event!(node_a, PaymentSuccessful);
+		expect_event!(node_b, PaymentReceived);
+	}
+
 	println!("\nB close_channel (force: {})", force_close);
 	tokio::time::sleep(Duration::from_secs(1)).await;
 	if force_close {
 		node_a.force_close_channel(&user_channel_id_a, node_b.node_id(), None).unwrap();
 	} else {
 		node_a.close_channel(&user_channel_id_a, node_b.node_id()).unwrap();
+		// The cooperative shutdown may complete before we get to check, but if the channel
+		// is still visible it must already be in a shutdown state.
+		if let Some(channel) =
+			node_a.list_channels().into_iter().find(|c| c.user_channel_id == user_channel_id_a)
+		{
+			assert!(
+				!matches!(
+					channel.channel_shutdown_state,
+					None | Some(ChannelShutdownState::NotShuttingDown)
+				),
+				"Expected shutdown in progress on node_a, got {:?}",
+				channel.channel_shutdown_state,
+			);
+		}
 	}
 
 	expect_event!(node_a, ChannelClosed);
@@ -1357,6 +1549,49 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
 		node_a.sync_wallets().unwrap();
 		node_b.sync_wallets().unwrap();
+	} else {
+		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
+		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
+		let node_a_blocks_to_go = match node_a.list_balances().lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(counterparty_node_id, node_b.node_id());
+				let cur_height = node_a.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				blocks_to_go
+			},
+			_ => panic!("Unexpected balance state!"),
+		};
+
+		assert_eq!(node_b.list_balances().lightning_balances.len(), 1);
+		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
+		let node_b_blocks_to_go = match node_b.list_balances().lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(counterparty_node_id, node_a.node_id());
+				let cur_height = node_b.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				blocks_to_go
+			},
+			_ => panic!("Unexpected balance state!"),
+		};
+
+		assert_eq!(node_a_blocks_to_go, node_b_blocks_to_go);
+
+		generate_blocks_and_wait(&bitcoind, electrsd, node_a_blocks_to_go as usize).await;
+		node_a.sync_wallets().unwrap();
+		node_b.sync_wallets().unwrap();
+
+		assert!(node_a.list_balances().lightning_balances.is_empty());
+		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
+		assert!(node_b.list_balances().lightning_balances.is_empty());
+		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
 	}
 
 	let sum_of_all_payments_sat = (push_msat

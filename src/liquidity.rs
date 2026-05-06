@@ -142,6 +142,14 @@ pub struct LSPS2ServiceConfig {
 	///
 	/// [`bLIP-52`]: https://github.com/lightning/blips/blob/master/blip-0052.md#trust-models
 	pub client_trusts_lsp: bool,
+	/// When set, we will allow clients to spend their entire channel balance in the channels
+	/// we open to them. This allows clients to try to steal your channel balance with
+	/// no financial penalty, so this should only be set if you trust your clients.
+	///
+	/// See [`Node::open_0reserve_channel`] to manually open these channels.
+	///
+	/// [`Node::open_0reserve_channel`]: crate::Node::open_0reserve_channel
+	pub disable_client_reserve: bool,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -302,7 +310,7 @@ where
 	L::Target: LdkLogger,
 {
 	pub(crate) fn set_peer_manager(&self, peer_manager: Weak<PeerManager>) {
-		*self.peer_manager.write().unwrap() = Some(peer_manager);
+		*self.peer_manager.write().expect("lock") = Some(peer_manager);
 	}
 
 	pub(crate) fn liquidity_manager(&self) -> Arc<LiquidityManager> {
@@ -407,7 +415,7 @@ where
 					if let Some(sender) = lsps1_client
 						.pending_opening_params_requests
 						.lock()
-						.unwrap()
+						.expect("lock")
 						.remove(&request_id)
 					{
 						let response = LSPS1OpeningParamsResponse { supported_options };
@@ -463,7 +471,7 @@ where
 					if let Some(sender) = lsps1_client
 						.pending_create_order_requests
 						.lock()
-						.unwrap()
+						.expect("lock")
 						.remove(&request_id)
 					{
 						let response = LSPS1OrderStatus {
@@ -521,7 +529,7 @@ where
 					if let Some(sender) = lsps1_client
 						.pending_check_order_status_requests
 						.lock()
-						.unwrap()
+						.expect("lock")
 						.remove(&request_id)
 					{
 						let response = LSPS1OrderStatus {
@@ -642,7 +650,9 @@ where
 					};
 
 					let user_channel_id: u128 = u128::from_ne_bytes(
-						self.keys_manager.get_secure_random_bytes()[..16].try_into().unwrap(),
+						self.keys_manager.get_secure_random_bytes()[..16]
+							.try_into()
+							.expect("a 16-byte slice should convert into a [u8; 16]"),
 					);
 					let intercept_scid = self.channel_manager.get_intercept_scid();
 
@@ -717,7 +727,7 @@ where
 				};
 
 				let init_features = if let Some(Some(peer_manager)) =
-					self.peer_manager.read().unwrap().as_ref().map(|weak| weak.upgrade())
+					self.peer_manager.read().expect("lock").as_ref().map(|weak| weak.upgrade())
 				{
 					// Fail if we're not connected to the prospective channel partner.
 					if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
@@ -771,13 +781,16 @@ where
 
 				let mut config = self.channel_manager.get_current_config().clone();
 
-				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
+				// If we act as an LSPS2 service, the HTLC-value-in-flight must be 100% of the
+				// channel value to ensure we can forward the initial payment. That cap only
+				// applies to unannounced channels, so the channel must also be unannounced.
 				debug_assert_eq!(
 					config
 						.channel_handshake_config
-						.max_inbound_htlc_value_in_flight_percent_of_channel,
+						.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
 					100
 				);
+				debug_assert!(!config.channel_handshake_config.announce_for_forwarding);
 				debug_assert!(config.accept_forwards_to_priv_channels);
 
 				// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
@@ -786,22 +799,38 @@ where
 				config.channel_config.forwarding_fee_base_msat = 0;
 				config.channel_config.forwarding_fee_proportional_millionths = 0;
 
-				match self.channel_manager.create_channel(
-					their_network_key,
-					channel_amount_sats,
-					0,
-					user_channel_id,
-					None,
-					Some(config),
-				) {
+				let result = if service_config.disable_client_reserve {
+					self.channel_manager.create_channel_to_trusted_peer_0reserve(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				} else {
+					self.channel_manager.create_channel(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				};
+
+				match result {
 					Ok(_) => {},
 					Err(e) => {
 						// TODO: We just silently fail here. Eventually we will need to remember
 						// the pending requests and regularly retry opening the channel until we
 						// succeed.
+						let zero_reserve_string =
+							if service_config.disable_client_reserve { "0reserve " } else { "" };
 						log_error!(
 							self.logger,
-							"Failed to open LSPS2 channel to {}: {:?}",
+							"Failed to open LSPS2 {}channel to {}: {:?}",
+							zero_reserve_string,
 							their_network_key,
 							e
 						);
@@ -828,7 +857,7 @@ where
 					}
 
 					if let Some(sender) =
-						lsps2_client.pending_fee_requests.lock().unwrap().remove(&request_id)
+						lsps2_client.pending_fee_requests.lock().expect("lock").remove(&request_id)
 					{
 						let response = LSPS2FeeResponse { opening_fee_params_menu };
 
@@ -880,7 +909,7 @@ where
 					}
 
 					if let Some(sender) =
-						lsps2_client.pending_buy_requests.lock().unwrap().remove(&request_id)
+						lsps2_client.pending_buy_requests.lock().expect("lock").remove(&request_id)
 					{
 						let response = LSPS2BuyResponse { intercept_scid, cltv_expiry_delta };
 
@@ -930,7 +959,7 @@ where
 		let (request_sender, request_receiver) = oneshot::channel();
 		{
 			let mut pending_opening_params_requests_lock =
-				lsps1_client.pending_opening_params_requests.lock().unwrap();
+				lsps1_client.pending_opening_params_requests.lock().expect("lock");
 			let request_id = client_handler.request_supported_options(lsps1_client.lsp_node_id);
 			pending_opening_params_requests_lock.insert(request_id, request_sender);
 		}
@@ -1013,7 +1042,7 @@ where
 		let request_id;
 		{
 			let mut pending_create_order_requests_lock =
-				lsps1_client.pending_create_order_requests.lock().unwrap();
+				lsps1_client.pending_create_order_requests.lock().expect("lock");
 			request_id = client_handler.create_order(
 				&lsps1_client.lsp_node_id,
 				order_params.clone(),
@@ -1059,7 +1088,7 @@ where
 		let (request_sender, request_receiver) = oneshot::channel();
 		{
 			let mut pending_check_order_status_requests_lock =
-				lsps1_client.pending_check_order_status_requests.lock().unwrap();
+				lsps1_client.pending_check_order_status_requests.lock().expect("lock");
 			let request_id = client_handler.check_order_status(&lsps1_client.lsp_node_id, order_id);
 			pending_check_order_status_requests_lock.insert(request_id, request_sender);
 		}
@@ -1200,7 +1229,8 @@ where
 
 		let (fee_request_sender, fee_request_receiver) = oneshot::channel();
 		{
-			let mut pending_fee_requests_lock = lsps2_client.pending_fee_requests.lock().unwrap();
+			let mut pending_fee_requests_lock =
+				lsps2_client.pending_fee_requests.lock().expect("lock");
 			let request_id = client_handler
 				.request_opening_params(lsps2_client.lsp_node_id, lsps2_client.token.clone());
 			pending_fee_requests_lock.insert(request_id, fee_request_sender);
@@ -1233,7 +1263,8 @@ where
 
 		let (buy_request_sender, buy_request_receiver) = oneshot::channel();
 		{
-			let mut pending_buy_requests_lock = lsps2_client.pending_buy_requests.lock().unwrap();
+			let mut pending_buy_requests_lock =
+				lsps2_client.pending_buy_requests.lock().expect("lock");
 			let request_id = client_handler
 				.select_opening_params(lsps2_client.lsp_node_id, amount_msat, opening_fee_params)
 				.map_err(|e| {

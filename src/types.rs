@@ -12,13 +12,19 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin_payment_instructions::amount::Amount as BPIAmount;
+use bitcoin_payment_instructions::dns_resolver::DNSHrnResolver;
+use bitcoin_payment_instructions::hrn_resolution::{
+	HrnResolutionFuture, HrnResolver, HumanReadableName, LNURLResolutionFuture,
+};
 use bitcoin_payment_instructions::onion_message_resolver::LDKOnionMessageDNSSECHrnResolver;
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
-use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
+use lightning::ln::channel_state::{ChannelDetails as LdkChannelDetails, ChannelShutdownState};
 use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::ln::types::ChannelId;
+use lightning::onion_message::dns_resolution::DNSResolverMessageHandler;
 use lightning::routing::gossip;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{CombinedScorer, ProbabilisticScoringFeeParameters};
@@ -51,7 +57,7 @@ where
 {
 }
 
-pub(crate) trait DynStoreTrait: Send + Sync {
+pub trait DynStoreTrait: Send + Sync {
 	fn read_async(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str,
 	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, bitcoin::io::Error>> + Send + 'static>>;
@@ -318,11 +324,44 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	Arc<MessageRouter>,
 	Arc<ChannelManager>,
 	Arc<ChannelManager>,
-	Arc<HRNResolver>,
+	Arc<dyn DNSResolverMessageHandler + Sync + Send>,
 	IgnoringMessageHandler,
 >;
 
-pub(crate) type HRNResolver = LDKOnionMessageDNSSECHrnResolver<Arc<Graph>, Arc<Logger>>;
+#[derive(Clone)]
+pub enum HRNResolver {
+	Onion(Arc<LDKOnionMessageDNSSECHrnResolver<Arc<Graph>, Arc<Logger>>>),
+	Local(Arc<DNSHrnResolver>),
+}
+
+impl HrnResolver for HRNResolver {
+	fn resolve_hrn<'a>(&'a self, hrn: &'a HumanReadableName) -> HrnResolutionFuture<'a> {
+		match self {
+			HRNResolver::Onion(inner) => inner.resolve_hrn(hrn),
+			HRNResolver::Local(inner) => inner.resolve_hrn(hrn),
+		}
+	}
+
+	fn resolve_lnurl<'a>(&'a self, url: &'a str) -> HrnResolutionFuture<'a> {
+		match self {
+			HRNResolver::Onion(inner) => inner.resolve_lnurl(url),
+			HRNResolver::Local(inner) => inner.resolve_lnurl(url),
+		}
+	}
+
+	fn resolve_lnurl_to_invoice<'a>(
+		&'a self, callback_url: String, amount: BPIAmount, expected_description_hash: [u8; 32],
+	) -> LNURLResolutionFuture<'a> {
+		match self {
+			HRNResolver::Onion(inner) => {
+				inner.resolve_lnurl_to_invoice(callback_url, amount, expected_description_hash)
+			},
+			HRNResolver::Local(inner) => {
+				inner.resolve_lnurl_to_invoice(callback_url, amount, expected_description_hash)
+			},
+		}
+	}
+}
 
 pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
@@ -558,6 +597,10 @@ pub struct ChannelDetails {
 	pub inbound_htlc_maximum_msat: Option<u64>,
 	/// Set of configurable parameters that affect channel operation.
 	pub config: ChannelConfig,
+	/// The current shutdown state of the channel, if any.
+	///
+	/// Will be `None` for objects serialized with LDK Node v0.1 and earlier.
+	pub channel_shutdown_state: Option<ChannelShutdownState>,
 }
 
 impl From<LdkChannelDetails> for ChannelDetails {
@@ -573,9 +616,9 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			channel_value_sats: value.channel_value_satoshis,
 			unspendable_punishment_reserve: value.unspendable_punishment_reserve,
 			user_channel_id: UserChannelId(value.user_channel_id),
-			// unwrap safety: This value will be `None` for objects serialized with LDK versions
-			// prior to 0.0.115.
-			feerate_sat_per_1000_weight: value.feerate_sat_per_1000_weight.unwrap(),
+			feerate_sat_per_1000_weight: value
+				.feerate_sat_per_1000_weight
+				.expect("value is set for objects serialized with LDK v0.0.115+"),
 			outbound_capacity_msat: value.outbound_capacity_msat,
 			inbound_capacity_msat: value.inbound_capacity_msat,
 			confirmations_required: value.confirmations_required,
@@ -608,11 +651,15 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			next_outbound_htlc_limit_msat: value.next_outbound_htlc_limit_msat,
 			next_outbound_htlc_minimum_msat: value.next_outbound_htlc_minimum_msat,
 			force_close_spend_delay: value.force_close_spend_delay,
-			// unwrap safety: This field is only `None` for objects serialized prior to LDK 0.0.107
-			inbound_htlc_minimum_msat: value.inbound_htlc_minimum_msat.unwrap_or(0),
+			inbound_htlc_minimum_msat: value
+				.inbound_htlc_minimum_msat
+				.expect("value is set for objects serialized with LDK v0.0.107+"),
 			inbound_htlc_maximum_msat: value.inbound_htlc_maximum_msat,
-			// unwrap safety: `config` is only `None` for LDK objects serialized prior to 0.0.109.
-			config: value.config.map(|c| c.into()).unwrap(),
+			config: value
+				.config
+				.map(|c| c.into())
+				.expect("value is set for objects serialized with LDK v0.0.109+"),
+			channel_shutdown_state: value.channel_shutdown_state,
 		}
 	}
 }

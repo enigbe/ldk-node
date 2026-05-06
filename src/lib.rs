@@ -121,7 +121,7 @@ use bitcoin::secp256k1::PublicKey;
 pub use bitcoin::FeeRate;
 #[cfg(not(feature = "uniffi"))]
 use bitcoin::FeeRate;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, BlockHash, Network};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
@@ -143,12 +143,13 @@ use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use ffi::*;
 use gossip::GossipSource;
 use graph::NetworkGraph;
-use io::utils::write_node_metrics;
+use io::utils::update_and_persist_node_metrics;
 pub use lightning;
-use lightning::chain::BestBlock;
+use lightning::chain::BestBlock as BlockLocator;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::FUNDING_TRANSACTION_WITNESS_WEIGHT;
-use lightning::ln::channel_state::{ChannelDetails as LdkChannelDetails, ChannelShutdownState};
+use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
+pub use lightning::ln::channel_state::ChannelShutdownState;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
@@ -237,7 +238,7 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
-	hrn_resolver: Arc<HRNResolver>,
+	hrn_resolver: HRNResolver,
 	#[cfg(cycle_tests)]
 	_leak_checker: LeakChecker,
 }
@@ -253,7 +254,7 @@ impl Node {
 	/// a thread-safe manner.
 	pub fn start(&self) -> Result<(), Error> {
 		// Acquire a run lock and hold it until we're setup.
-		let mut is_running_lock = self.is_running.write().unwrap();
+		let mut is_running_lock = self.is_running.write().expect("lock");
 		if *is_running_lock {
 			return Err(Error::AlreadyRunning);
 		}
@@ -296,9 +297,7 @@ impl Node {
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
-			let gossip_sync_store = Arc::clone(&self.kv_store);
 			let gossip_sync_logger = Arc::clone(&self.logger);
-			let gossip_node_metrics = Arc::clone(&self.node_metrics);
 			let mut stop_gossip_sync = self.stop_sender.subscribe();
 			self.runtime.spawn_cancellable_background_task(async move {
 				let mut interval = tokio::time::interval(RGS_SYNC_INTERVAL);
@@ -314,20 +313,12 @@ impl Node {
 						_ = interval.tick() => {
 							let now = Instant::now();
 							match gossip_source.update_rgs_snapshot().await {
-								Ok(updated_timestamp) => {
+								Ok(_updated_timestamp) => {
 									log_info!(
 										gossip_sync_logger,
 										"Background sync of RGS gossip data finished in {}ms.",
 										now.elapsed().as_millis()
-										);
-									{
-										let mut locked_node_metrics = gossip_node_metrics.write().unwrap();
-										locked_node_metrics.latest_rgs_snapshot_timestamp = Some(updated_timestamp);
-										write_node_metrics(&*locked_node_metrics, &*gossip_sync_store, Arc::clone(&gossip_sync_logger))
-											.unwrap_or_else(|e| {
-												log_error!(gossip_sync_logger, "Persistence failed: {}", e);
-											});
-									}
+									);
 								}
 								Err(e) => {
 									log_error!(
@@ -419,13 +410,27 @@ impl Node {
 								break;
 							}
 							res = listener.accept() => {
-								let tcp_stream = res.unwrap().0;
+								let tcp_stream = match res {
+									Ok((tcp_stream, _)) => tcp_stream,
+									Err(e) => {
+										log_error!(logger, "Failed to accept inbound connection: {}", e);
+										continue;
+									},
+								};
 								let peer_mgr = Arc::clone(&peer_mgr);
+								let logger = Arc::clone(&logger);
 								runtime.spawn_cancellable_background_task(async move {
+									let tcp_stream = match tcp_stream.into_std() {
+										Ok(tcp_stream) => tcp_stream,
+										Err(e) => {
+											log_error!(logger, "Failed to convert inbound connection: {}", e);
+											return;
+										},
+									};
 									lightning_net_tokio::setup_inbound(
 										Arc::clone(&peer_mgr),
-										tcp_stream.into_std().unwrap(),
-										)
+										tcp_stream,
+									)
 										.await;
 								});
 							}
@@ -497,7 +502,7 @@ impl Node {
 							return;
 						}
 						_ = interval.tick() => {
-							let skip_broadcast = match bcast_node_metrics.read().unwrap().latest_node_announcement_broadcast_timestamp {
+							let skip_broadcast = match bcast_node_metrics.read().expect("lock").latest_node_announcement_broadcast_timestamp {
 								Some(latest_bcast_time_secs) => {
 									// Skip if the time hasn't elapsed yet.
 									let next_bcast_unix_time = SystemTime::UNIX_EPOCH + Duration::from_secs(latest_bcast_time_secs) + NODE_ANN_BCAST_INTERVAL;
@@ -537,14 +542,15 @@ impl Node {
 
 								let unix_time_secs_opt =
 									SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-								{
-									let mut locked_node_metrics = bcast_node_metrics.write().unwrap();
-									locked_node_metrics.latest_node_announcement_broadcast_timestamp = unix_time_secs_opt;
-									write_node_metrics(&*locked_node_metrics, &*bcast_store, Arc::clone(&bcast_logger))
-										.unwrap_or_else(|e| {
-											log_error!(bcast_logger, "Persistence failed: {}", e);
-										});
-								}
+								update_and_persist_node_metrics(
+									&bcast_node_metrics,
+									&*bcast_store,
+									Arc::clone(&bcast_logger),
+									|m| m.latest_node_announcement_broadcast_timestamp = unix_time_secs_opt,
+								)
+								.unwrap_or_else(|e| {
+									log_error!(bcast_logger, "Persistence failed: {}", e);
+								});
 							} else {
 								debug_assert!(false, "We checked whether the node may announce, so node alias should always be set");
 								continue
@@ -645,7 +651,13 @@ impl Node {
 				Some(background_scorer),
 				sleeper,
 				true,
-				|| Some(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap()),
+				|| {
+					Some(
+						SystemTime::now()
+							.duration_since(SystemTime::UNIX_EPOCH)
+							.expect("current time should not be earlier than the Unix epoch"),
+					)
+				},
 			)
 			.await
 			.unwrap_or_else(|e| {
@@ -683,7 +695,7 @@ impl Node {
 	///
 	/// After this returns most API methods will return [`Error::NotRunning`].
 	pub fn stop(&self) -> Result<(), Error> {
-		let mut is_running_lock = self.is_running.write().unwrap();
+		let mut is_running_lock = self.is_running.write().expect("lock");
 		if !*is_running_lock {
 			return Err(Error::NotRunning);
 		}
@@ -747,9 +759,10 @@ impl Node {
 
 	/// Returns the status of the [`Node`].
 	pub fn status(&self) -> NodeStatus {
-		let is_running = *self.is_running.read().unwrap();
+		let is_running = *self.is_running.read().expect("lock");
+		let network = self.config.network;
 		let current_best_block = self.channel_manager.current_best_block().into();
-		let locked_node_metrics = self.node_metrics.read().unwrap();
+		let locked_node_metrics = self.node_metrics.read().expect("lock");
 		let latest_lightning_wallet_sync_timestamp =
 			locked_node_metrics.latest_lightning_wallet_sync_timestamp;
 		let latest_onchain_wallet_sync_timestamp =
@@ -757,7 +770,7 @@ impl Node {
 		let latest_fee_rate_cache_update_timestamp =
 			locked_node_metrics.latest_fee_rate_cache_update_timestamp;
 		let latest_rgs_snapshot_timestamp =
-			locked_node_metrics.latest_rgs_snapshot_timestamp.map(|val| val as u64);
+			self.network_graph.get_last_rapid_gossip_sync_timestamp().map(|val| val as u64);
 		let latest_pathfinding_scores_sync_timestamp =
 			locked_node_metrics.latest_pathfinding_scores_sync_timestamp;
 		let latest_node_announcement_broadcast_timestamp =
@@ -765,6 +778,7 @@ impl Node {
 
 		NodeStatus {
 			is_running,
+			network,
 			current_best_block,
 			latest_lightning_wallet_sync_timestamp,
 			latest_onchain_wallet_sync_timestamp,
@@ -994,7 +1008,7 @@ impl Node {
 			self.bolt12_payment().into(),
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
-			Arc::clone(&self.hrn_resolver),
+			self.hrn_resolver.clone(),
 		)
 	}
 
@@ -1015,7 +1029,7 @@ impl Node {
 			self.bolt12_payment(),
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
-			Arc::clone(&self.hrn_resolver),
+			self.hrn_resolver.clone(),
 		))
 	}
 
@@ -1078,7 +1092,7 @@ impl Node {
 	pub fn connect(
 		&self, node_id: PublicKey, address: SocketAddress, persist: bool,
 	) -> Result<(), Error> {
-		if !*self.is_running.read().unwrap() {
+		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
 
@@ -1108,7 +1122,7 @@ impl Node {
 	/// Will also remove the peer from the peer store, i.e., after this has been called we won't
 	/// try to reconnect on restart.
 	pub fn disconnect(&self, counterparty_node_id: PublicKey) -> Result<(), Error> {
-		if !*self.is_running.read().unwrap() {
+		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
 
@@ -1128,9 +1142,9 @@ impl Node {
 	fn open_channel_inner(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: FundingAmount,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
-		announce_for_forwarding: bool,
+		announce_for_forwarding: bool, disable_counterparty_reserve: bool,
 	) -> Result<UserChannelId, Error> {
-		if !*self.is_running.read().unwrap() {
+		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
 
@@ -1182,39 +1196,65 @@ impl Node {
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
 		user_config.channel_config = (channel_config.unwrap_or_default()).clone().into();
-		// We set the max inflight to 100% for private channels.
-		// FIXME: LDK will default to this behavior soon, too, at which point we should drop this
-		// manual override.
+
+		// Unannounced channels rely on LDK's default of 100% inbound HTLC value-in-flight
+		// to support large initial payments via LSPS2.
 		if !announce_for_forwarding {
-			user_config
-				.channel_handshake_config
-				.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+			debug_assert_eq!(
+				user_config
+					.channel_handshake_config
+					.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
+				100
+			);
 		}
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = u128::from_ne_bytes(
-			self.keys_manager.get_secure_random_bytes()[..16].try_into().unwrap(),
+			self.keys_manager.get_secure_random_bytes()[..16]
+				.try_into()
+				.expect("a 16-byte slice should convert into a [u8; 16]"),
 		);
 
-		match self.channel_manager.create_channel(
-			peer_info.node_id,
-			channel_amount_sats,
-			push_msat,
-			user_channel_id,
-			None,
-			Some(user_config),
-		) {
+		let result = if disable_counterparty_reserve {
+			self.channel_manager.create_channel_to_trusted_peer_0reserve(
+				peer_info.node_id,
+				channel_amount_sats,
+				push_msat,
+				user_channel_id,
+				None,
+				Some(user_config),
+			)
+		} else {
+			self.channel_manager.create_channel(
+				peer_info.node_id,
+				channel_amount_sats,
+				push_msat,
+				user_channel_id,
+				None,
+				Some(user_config),
+			)
+		};
+
+		let zero_reserve_string = if disable_counterparty_reserve { "0reserve " } else { "" };
+
+		match result {
 			Ok(_) => {
 				log_info!(
 					self.logger,
-					"Initiated channel creation with peer {}. ",
+					"Initiated {}channel creation with peer {}. ",
+					zero_reserve_string,
 					peer_info.node_id
 				);
 				self.peer_store.add_peer(peer_info)?;
 				Ok(UserChannelId(user_channel_id))
 			},
 			Err(e) => {
-				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
+				log_error!(
+					self.logger,
+					"Failed to initiate {}channel creation: {:?}",
+					zero_reserve_string,
+					e
+				);
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1290,6 +1330,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			false,
+			false,
 		)
 	}
 
@@ -1330,6 +1371,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			true,
+			false,
 		)
 	}
 
@@ -1357,6 +1399,7 @@ impl Node {
 			FundingAmount::Max,
 			push_to_counterparty_msat,
 			channel_config,
+			false,
 			false,
 		)
 	}
@@ -1394,6 +1437,70 @@ impl Node {
 			FundingAmount::Max,
 			push_to_counterparty_msat,
 			channel_config,
+			true,
+			false,
+		)
+	}
+
+	/// Connect to a node and open a new unannounced channel, in which the target node can
+	/// spend its entire balance.
+	///
+	/// This channel allows the target node to try to steal your channel balance with no
+	/// financial penalty, so this channel should only be opened to nodes you trust.
+	///
+	/// Disconnects and reconnects are handled automatically.
+	///
+	/// If `push_to_counterparty_msat` is set, the given value will be pushed (read: sent) to the
+	/// channel counterparty on channel open. This can be useful to start out with the balance not
+	/// entirely shifted to one side, therefore allowing to receive payments from the getgo.
+	///
+	/// If Anchor channels are enabled, this will ensure the configured
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] is available and will be retained before
+	/// opening the channel.
+	///
+	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
+	///
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
+	pub fn open_0reserve_channel(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+	) -> Result<UserChannelId, Error> {
+		self.open_channel_inner(
+			node_id,
+			address,
+			FundingAmount::Exact { amount_sats: channel_amount_sats },
+			push_to_counterparty_msat,
+			channel_config,
+			false,
+			true,
+		)
+	}
+
+	/// Connect to a node and open a new unannounced channel, using all available on-chain funds
+	/// minus fees and anchor reserves. The target node will be able to spend its entire channel
+	/// balance.
+	///
+	/// This channel allows the target node to try to steal your channel balance with no
+	/// financial penalty, so this channel should only be opened to nodes you trust.
+	///
+	/// Disconnects and reconnects are handled automatically.
+	///
+	/// If `push_to_counterparty_msat` is set, the given value will be pushed (read: sent) to the
+	/// channel counterparty on channel open. This can be useful to start out with the balance not
+	/// entirely shifted to one side, therefore allowing to receive payments from the getgo.
+	///
+	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
+	pub fn open_0reserve_channel_with_all(
+		&self, node_id: PublicKey, address: SocketAddress, push_to_counterparty_msat: Option<u64>,
+		channel_config: Option<ChannelConfig>,
+	) -> Result<UserChannelId, Error> {
+		self.open_channel_inner(
+			node_id,
+			address,
+			FundingAmount::Max,
+			push_to_counterparty_msat,
+			channel_config,
+			false,
 			true,
 		)
 	}
@@ -1469,12 +1576,7 @@ impl Node {
 
 			let funding_template = self
 				.channel_manager
-				.splice_channel(
-					&channel_details.channel_id,
-					&counterparty_node_id,
-					min_feerate,
-					max_feerate,
-				)
+				.splice_channel(&channel_details.channel_id, &counterparty_node_id)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
 					Error::ChannelSplicingFailed
@@ -1482,12 +1584,14 @@ impl Node {
 
 			let contribution = self
 				.runtime
-				.block_on(
-					funding_template
-						.splice_in(Amount::from_sat(splice_amount_sats), Arc::clone(&self.wallet)),
-				)
-				.map_err(|()| {
-					log_error!(self.logger, "Failed to splice channel: coin selection failed");
+				.block_on(funding_template.splice_in(
+					Amount::from_sat(splice_amount_sats),
+					min_feerate,
+					max_feerate,
+					Arc::clone(&self.wallet),
+				))
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to splice channel: {}", e);
 					Error::ChannelSplicingFailed
 				})?;
 
@@ -1585,12 +1689,7 @@ impl Node {
 
 			let funding_template = self
 				.channel_manager
-				.splice_channel(
-					&channel_details.channel_id,
-					&counterparty_node_id,
-					min_feerate,
-					max_feerate,
-				)
+				.splice_channel(&channel_details.channel_id, &counterparty_node_id)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
 					Error::ChannelSplicingFailed
@@ -1602,9 +1701,14 @@ impl Node {
 			}];
 			let contribution = self
 				.runtime
-				.block_on(funding_template.splice_out(outputs, Arc::clone(&self.wallet)))
-				.map_err(|()| {
-					log_error!(self.logger, "Failed to splice channel: coin selection failed");
+				.block_on(funding_template.splice_out(
+					outputs,
+					min_feerate,
+					max_feerate,
+					Arc::clone(&self.wallet),
+				))
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to splice channel: {}", e);
 					Error::ChannelSplicingFailed
 				})?;
 
@@ -1641,7 +1745,7 @@ impl Node {
 	///
 	/// [`EsploraSyncConfig::background_sync_config`]: crate::config::EsploraSyncConfig::background_sync_config
 	pub fn sync_wallets(&self) -> Result<(), Error> {
-		if !*self.is_running.read().unwrap() {
+		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
 
@@ -1957,12 +2061,30 @@ impl Drop for Node {
 	}
 }
 
+/// The best known block as identified by its hash and height.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct BestBlock {
+	/// The block's hash.
+	pub block_hash: BlockHash,
+	/// The height at which the block was confirmed.
+	pub height: u32,
+}
+
+impl From<BlockLocator> for BestBlock {
+	fn from(locator: BlockLocator) -> Self {
+		Self { block_hash: locator.block_hash, height: locator.height }
+	}
+}
+
 /// Represents the status of the [`Node`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NodeStatus {
 	/// Indicates whether the [`Node`] is running.
 	pub is_running: bool,
+	/// Network (e.g. mainnet, testnet4, signet) on which the [`Node`] is running.
+	pub network: Network,
 	/// The best block to which our Lightning wallet is currently synced.
 	pub current_best_block: BestBlock,
 	/// The timestamp, in seconds since start of the UNIX epoch, when we last successfully synced
@@ -2000,7 +2122,6 @@ pub(crate) struct NodeMetrics {
 	latest_lightning_wallet_sync_timestamp: Option<u64>,
 	latest_onchain_wallet_sync_timestamp: Option<u64>,
 	latest_fee_rate_cache_update_timestamp: Option<u64>,
-	latest_rgs_snapshot_timestamp: Option<u32>,
 	latest_pathfinding_scores_sync_timestamp: Option<u64>,
 	latest_node_announcement_broadcast_timestamp: Option<u64>,
 }
@@ -2011,7 +2132,6 @@ impl Default for NodeMetrics {
 			latest_lightning_wallet_sync_timestamp: None,
 			latest_onchain_wallet_sync_timestamp: None,
 			latest_fee_rate_cache_update_timestamp: None,
-			latest_rgs_snapshot_timestamp: None,
 			latest_pathfinding_scores_sync_timestamp: None,
 			latest_node_announcement_broadcast_timestamp: None,
 		}
@@ -2023,7 +2143,8 @@ impl_writeable_tlv_based!(NodeMetrics, {
 	(1, latest_pathfinding_scores_sync_timestamp, option),
 	(2, latest_onchain_wallet_sync_timestamp, option),
 	(4, latest_fee_rate_cache_update_timestamp, option),
-	(6, latest_rgs_snapshot_timestamp, option),
+	// 6 used to be latest_rgs_snapshot_timestamp
+	(6, _legacy_latest_rgs_snapshot_timestamp, (legacy, u32, |_| Ok(()), |_: &NodeMetrics| None::<Option<u32>> )),
 	(8, latest_node_announcement_broadcast_timestamp, option),
 	// 10 used to be latest_channel_monitor_archival_height
 	(10, _legacy_latest_channel_monitor_archival_height, (legacy, u32, |_| Ok(()), |_: &NodeMetrics| None::<Option<u32>> )),
@@ -2063,4 +2184,56 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 			c.per_channel_reserve_sats
 		}
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use lightning::util::ser::{Readable, Writeable};
+
+	use super::*;
+
+	#[test]
+	fn node_metrics_reads_legacy_rgs_snapshot_timestamp() {
+		// Pre-#615, `NodeMetrics` persisted `latest_rgs_snapshot_timestamp` as an optional
+		// `u32` at TLV slot 6. The field has since been retired, but we must still read
+		// records written by older versions without failing. The shadow struct below
+		// mirrors main's `NodeMetrics` layout 1:1 so the byte stream we decode matches
+		// what an older on-disk record actually looked like.
+		#[derive(Debug)]
+		struct OldNodeMetrics {
+			latest_lightning_wallet_sync_timestamp: Option<u64>,
+			latest_onchain_wallet_sync_timestamp: Option<u64>,
+			latest_fee_rate_cache_update_timestamp: Option<u64>,
+			latest_rgs_snapshot_timestamp: Option<u32>,
+			latest_pathfinding_scores_sync_timestamp: Option<u64>,
+			latest_node_announcement_broadcast_timestamp: Option<u64>,
+		}
+		impl_writeable_tlv_based!(OldNodeMetrics, {
+			(0, latest_lightning_wallet_sync_timestamp, option),
+			(1, latest_pathfinding_scores_sync_timestamp, option),
+			(2, latest_onchain_wallet_sync_timestamp, option),
+			(4, latest_fee_rate_cache_update_timestamp, option),
+			(6, latest_rgs_snapshot_timestamp, option),
+			(8, latest_node_announcement_broadcast_timestamp, option),
+			// 10 used to be latest_channel_monitor_archival_height
+			(10, _legacy_latest_channel_monitor_archival_height, (legacy, u32, |_| Ok(()), |_: &OldNodeMetrics| None::<Option<u32>> )),
+		});
+
+		let old = OldNodeMetrics {
+			latest_lightning_wallet_sync_timestamp: Some(1_000),
+			latest_onchain_wallet_sync_timestamp: Some(1_100),
+			latest_fee_rate_cache_update_timestamp: Some(1_200),
+			latest_rgs_snapshot_timestamp: Some(1_700_000_000),
+			latest_pathfinding_scores_sync_timestamp: Some(1_300),
+			latest_node_announcement_broadcast_timestamp: Some(2_000),
+		};
+		let bytes = old.encode();
+
+		let new = NodeMetrics::read(&mut &bytes[..]).unwrap();
+		assert_eq!(new.latest_lightning_wallet_sync_timestamp, Some(1_000));
+		assert_eq!(new.latest_onchain_wallet_sync_timestamp, Some(1_100));
+		assert_eq!(new.latest_fee_rate_cache_update_timestamp, Some(1_200));
+		assert_eq!(new.latest_pathfinding_scores_sync_timestamp, Some(1_300));
+		assert_eq!(new.latest_node_announcement_broadcast_timestamp, Some(2_000));
+	}
 }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use bitcoin::{Script, Txid};
-use lightning::chain::{BestBlock, Filter};
+use lightning::chain::{BestBlock as BlockLocator, Filter};
 
 use crate::chain::bitcoind::{BitcoindChainSource, UtxoSourceClient};
 use crate::chain::electrum::ElectrumChainSource;
@@ -101,7 +101,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> Result<(Self, Option<BlockLocator>), ()> {
 		let esplora_chain_source = EsploraChainSource::new(
 			server_url,
 			headers,
@@ -111,10 +111,10 @@ impl ChainSource {
 			config,
 			Arc::clone(&logger),
 			node_metrics,
-		);
+		)?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
 		let registered_txids = Mutex::new(Vec::new());
-		(Self { kind, registered_txids, tx_broadcaster, logger }, None)
+		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, None))
 	}
 
 	pub(crate) fn new_electrum(
@@ -122,7 +122,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> (Self, Option<BlockLocator>) {
 		let electrum_chain_source = ElectrumChainSource::new(
 			server_url,
 			sync_config,
@@ -142,7 +142,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> (Self, Option<BlockLocator>) {
 		let bitcoind_chain_source = BitcoindChainSource::new_rpc(
 			rpc_host,
 			rpc_port,
@@ -165,7 +165,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, rest_client_config: BitcoindRestClientConfig,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> (Self, Option<BlockLocator>) {
 		let bitcoind_chain_source = BitcoindChainSource::new_rest(
 			rpc_host,
 			rpc_port,
@@ -215,7 +215,7 @@ impl ChainSource {
 	}
 
 	pub(crate) fn registered_txids(&self) -> Vec<Txid> {
-		self.registered_txids.lock().unwrap().clone()
+		self.registered_txids.lock().expect("lock").clone()
 	}
 
 	pub(crate) fn is_transaction_based(&self) -> bool {
@@ -472,7 +472,7 @@ impl ChainSource {
 
 impl Filter for ChainSource {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
-		self.registered_txids.lock().unwrap().push(*txid);
+		self.registered_txids.lock().expect("lock").push(*txid);
 		match &self.kind {
 			ChainSourceKind::Esplora(esplora_chain_source) => {
 				esplora_chain_source.register_tx(txid, script_pubkey)
