@@ -44,7 +44,7 @@ pub use lightning_liquidity::lsps0::ser::LSPSDateTime;
 pub use lightning_liquidity::lsps1::msgs::{
 	LSPS1ChannelInfo, LSPS1OrderId, LSPS1OrderParams, LSPS1PaymentState,
 };
-use lightning_types::features::NodeFeatures;
+use lightning_types::features::NodeFeatures as LdkNodeFeatures;
 pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 pub use lightning_types::string::UntrustedString;
 use vss_client::headers::{
@@ -1520,12 +1520,300 @@ pub enum ClosureReason {
 	},
 }
 
-#[cfg(feature = "uniffi")]
-uniffi::custom_type!(NodeFeatures, Vec<u8>, {
-	remote,
-	try_lift: |val| Ok(NodeFeatures::from_le_bytes(val)),
-	lower: |obj| obj.le_flags().to_vec(),
-});
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Eq)]
+pub struct NodeFeatures {
+	pub(crate) inner: LdkNodeFeatures,
+}
+
+impl NodeFeatures {
+	/// Constructs node features from big-endian BOLT 9 encoded bytes.
+	#[uniffi::constructor]
+	pub fn from_bytes(bytes: &[u8]) -> Self {
+		Self { inner: LdkNodeFeatures::from_be_bytes(bytes.to_vec()) }
+	}
+
+	/// Returns the BOLT 9 big-endian encoded representation of these features.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		self.inner.encode()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_data_loss_protect` (bit 1).
+	pub fn supports_data_loss_protect(&self) -> bool {
+		self.inner.supports_data_loss_protect()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_data_loss_protect` (bit 0).
+	pub fn requires_data_loss_protect(&self) -> bool {
+		self.inner.requires_data_loss_protect()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_upfront_shutdown_script` (bit 5).
+	pub fn supports_upfront_shutdown_script(&self) -> bool {
+		self.inner.supports_upfront_shutdown_script()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_upfront_shutdown_script` (bit 4).
+	pub fn requires_upfront_shutdown_script(&self) -> bool {
+		self.inner.requires_upfront_shutdown_script()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `gossip_queries` (bit 7).
+	pub fn supports_gossip_queries(&self) -> bool {
+		self.inner.supports_gossip_queries()
+	}
+
+	/// Whether this node's `node_announcement` requires `gossip_queries` (bit 6).
+	pub fn requires_gossip_queries(&self) -> bool {
+		self.inner.requires_gossip_queries()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `var_onion_optin` (bit 9).
+	pub fn supports_variable_length_onion(&self) -> bool {
+		self.inner.supports_variable_length_onion()
+	}
+
+	/// Whether this node's `node_announcement` requires `var_onion_optin` (bit 8).
+	pub fn requires_variable_length_onion(&self) -> bool {
+		self.inner.requires_variable_length_onion()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_static_remotekey` (bit 13).
+	pub fn supports_static_remote_key(&self) -> bool {
+		self.inner.supports_static_remote_key()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_static_remotekey` (bit 12).
+	pub fn requires_static_remote_key(&self) -> bool {
+		self.inner.requires_static_remote_key()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `payment_secret` (bit 15).
+	pub fn supports_payment_secret(&self) -> bool {
+		self.inner.supports_payment_secret()
+	}
+
+	/// Whether this node's `node_announcement` requires `payment_secret` (bit 14).
+	pub fn requires_payment_secret(&self) -> bool {
+		self.inner.requires_payment_secret()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `basic_mpp` (bit 17).
+	pub fn supports_basic_mpp(&self) -> bool {
+		self.inner.supports_basic_mpp()
+	}
+
+	/// Whether this node's `node_announcement` requires `basic_mpp` (bit 16).
+	pub fn requires_basic_mpp(&self) -> bool {
+		self.inner.requires_basic_mpp()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_support_large_channel` (bit 19).
+	pub fn supports_wumbo(&self) -> bool {
+		self.inner.supports_wumbo()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_support_large_channel` (bit 18).
+	pub fn requires_wumbo(&self) -> bool {
+		self.inner.requires_wumbo()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_anchors_nonzero_fee_htlc_tx` (bit 21).
+	pub fn supports_anchors_nonzero_fee_htlc_tx(&self) -> bool {
+		self.inner.supports_anchors_nonzero_fee_htlc_tx()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_anchors_nonzero_fee_htlc_tx` (bit 20).
+	pub fn requires_anchors_nonzero_fee_htlc_tx(&self) -> bool {
+		self.inner.requires_anchors_nonzero_fee_htlc_tx()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_anchors_zero_fee_htlc_tx` (bit 23).
+	pub fn supports_anchors_zero_fee_htlc_tx(&self) -> bool {
+		self.inner.supports_anchors_zero_fee_htlc_tx()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_anchors_zero_fee_htlc_tx` (bit 22).
+	pub fn requires_anchors_zero_fee_htlc_tx(&self) -> bool {
+		self.inner.requires_anchors_zero_fee_htlc_tx()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_route_blinding` (bit 25).
+	pub fn supports_route_blinding(&self) -> bool {
+		self.inner.supports_route_blinding()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_route_blinding` (bit 24).
+	pub fn requires_route_blinding(&self) -> bool {
+		self.inner.requires_route_blinding()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `opt_shutdown_anysegwit` (bit 27).
+	pub fn supports_shutdown_anysegwit(&self) -> bool {
+		self.inner.supports_shutdown_anysegwit()
+	}
+
+	/// Whether this node's `node_announcement` requires `opt_shutdown_anysegwit` (bit 26).
+	pub fn requires_shutdown_anysegwit(&self) -> bool {
+		self.inner.requires_shutdown_anysegwit()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_dual_fund` (bit 29).
+	pub fn supports_dual_fund(&self) -> bool {
+		self.inner.supports_dual_fund()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_dual_fund` (bit 28).
+	pub fn requires_dual_fund(&self) -> bool {
+		self.inner.requires_dual_fund()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_taproot` (bit 31).
+	pub fn supports_taproot(&self) -> bool {
+		self.inner.supports_taproot()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_taproot` (bit 30).
+	pub fn requires_taproot(&self) -> bool {
+		self.inner.requires_taproot()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_quiesce` (bit 35).
+	pub fn supports_quiescence(&self) -> bool {
+		self.inner.supports_quiescence()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_quiesce` (bit 34).
+	pub fn requires_quiescence(&self) -> bool {
+		self.inner.requires_quiescence()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_onion_messages` (bit 39).
+	pub fn supports_onion_messages(&self) -> bool {
+		self.inner.supports_onion_messages()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_onion_messages` (bit 38).
+	pub fn requires_onion_messages(&self) -> bool {
+		self.inner.requires_onion_messages()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_provide_storage` (bit 43).
+	pub fn supports_provide_storage(&self) -> bool {
+		self.inner.supports_provide_storage()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_provide_storage` (bit 42).
+	pub fn requires_provide_storage(&self) -> bool {
+		self.inner.requires_provide_storage()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_channel_type` (bit 45).
+	pub fn supports_channel_type(&self) -> bool {
+		self.inner.supports_channel_type()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_channel_type` (bit 44).
+	pub fn requires_channel_type(&self) -> bool {
+		self.inner.requires_channel_type()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_scid_alias` (bit 47).
+	pub fn supports_scid_privacy(&self) -> bool {
+		self.inner.supports_scid_privacy()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_scid_alias` (bit 46).
+	pub fn requires_scid_privacy(&self) -> bool {
+		self.inner.requires_scid_privacy()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_zeroconf` (bit 51).
+	pub fn supports_zero_conf(&self) -> bool {
+		self.inner.supports_zero_conf()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_zeroconf` (bit 50).
+	pub fn requires_zero_conf(&self) -> bool {
+		self.inner.requires_zero_conf()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `keysend` (bit 55).
+	pub fn supports_keysend(&self) -> bool {
+		self.inner.supports_keysend()
+	}
+
+	/// Whether this node's `node_announcement` requires `keysend` (bit 54).
+	pub fn requires_keysend(&self) -> bool {
+		self.inner.requires_keysend()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_trampoline` (bit 57).
+	pub fn supports_trampoline_routing(&self) -> bool {
+		self.inner.supports_trampoline_routing()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_trampoline` (bit 56).
+	pub fn requires_trampoline_routing(&self) -> bool {
+		self.inner.requires_trampoline_routing()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_simple_close` (bit 61).
+	pub fn supports_simple_close(&self) -> bool {
+		self.inner.supports_simple_close()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_simple_close` (bit 60).
+	pub fn requires_simple_close(&self) -> bool {
+		self.inner.requires_simple_close()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_splice` (bit 63).
+	pub fn supports_splicing(&self) -> bool {
+		self.inner.supports_splicing()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_splice` (bit 62).
+	pub fn requires_splicing(&self) -> bool {
+		self.inner.requires_splicing()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for `option_zero_fee_commitments` (bit 141, experimental).
+	pub fn supports_anchor_zero_fee_commitments(&self) -> bool {
+		self.inner.supports_anchor_zero_fee_commitments()
+	}
+
+	/// Whether this node's `node_announcement` requires `option_zero_fee_commitments` (bit 140, experimental).
+	pub fn requires_anchor_zero_fee_commitments(&self) -> bool {
+		self.inner.requires_anchor_zero_fee_commitments()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for HTLC hold (bit 153, experimental).
+	pub fn supports_htlc_hold(&self) -> bool {
+		self.inner.supports_htlc_hold()
+	}
+
+	/// Whether this node's `node_announcement` requires HTLC hold (bit 152, experimental).
+	pub fn requires_htlc_hold(&self) -> bool {
+		self.inner.requires_htlc_hold()
+	}
+
+	/// Whether this node's `node_announcement` advertises support for DNS resolution (bit 259).
+	pub fn supports_dns_resolution(&self) -> bool {
+		self.inner.supports_dns_resolution()
+	}
+
+	/// Whether this node's `node_announcement` requires DNS resolution (bit 258).
+	pub fn requires_dns_resolution(&self) -> bool {
+		self.inner.requires_dns_resolution()
+	}
+}
+
+impl From<LdkNodeFeatures> for NodeFeatures {
+	fn from(features: LdkNodeFeatures) -> Self {
+		Self { inner: features }
+	}
+}
 
 #[cfg(test)]
 mod tests {

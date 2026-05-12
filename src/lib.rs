@@ -113,6 +113,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(cycle_tests)]
 use std::{any::Any, sync::Weak};
 
+use crate::ffi::maybe_wrap;
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use bip39;
 pub use bitcoin;
@@ -161,7 +162,7 @@ use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use lightning_types::features::NodeFeatures;
+use lightning_types::features::NodeFeatures as LdkNodeFeatures;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -184,6 +185,11 @@ pub use vss_client;
 
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
+
+#[cfg(not(feature = "uniffi"))]
+type NodeFeatures = LdkNodeFeatures;
+#[cfg(feature = "uniffi")]
+type NodeFeatures = Arc<crate::ffi::NodeFeatures>;
 
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
@@ -777,7 +783,7 @@ impl Node {
 			locked_node_metrics.latest_pathfinding_scores_sync_timestamp;
 		let latest_node_announcement_broadcast_timestamp =
 			locked_node_metrics.latest_node_announcement_broadcast_timestamp;
-		let node_features = self.node_features();
+		let node_features = maybe_wrap(self.node_features());
 
 		NodeStatus {
 			is_running,
@@ -2059,12 +2065,12 @@ impl Node {
 	}
 
 	/// Return the features used in node announcement.
-	fn node_features(&self) -> NodeFeatures {
+	fn node_features(&self) -> LdkNodeFeatures {
 		let gossip_features = match self.gossip_source.as_gossip_sync() {
 			lightning_background_processor::GossipSync::P2P(p2p_gossip_sync) => {
 				p2p_gossip_sync.provided_node_features()
 			},
-			lightning_background_processor::GossipSync::Rapid(_) => NodeFeatures::empty(),
+			lightning_background_processor::GossipSync::Rapid(_) => LdkNodeFeatures::empty(),
 			lightning_background_processor::GossipSync::None => {
 				unreachable!("We must always have a gossip sync!")
 			},
@@ -2077,7 +2083,7 @@ impl Node {
 				.liquidity_source
 				.as_ref()
 				.map(|ls| ls.liquidity_manager().provided_node_features())
-				.unwrap_or_else(NodeFeatures::empty)
+				.unwrap_or_else(LdkNodeFeatures::empty)
 	}
 }
 
@@ -2140,7 +2146,7 @@ pub struct NodeStatus {
 	///
 	/// Will be `None` if we have no public channels or we haven't broadcasted yet.
 	pub latest_node_announcement_broadcast_timestamp: Option<u64>,
-	/// The features used within a node_announcement message.
+	/// The features advertised in this node's `node_announcement` message.
 	pub node_features: NodeFeatures,
 }
 
