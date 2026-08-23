@@ -27,9 +27,9 @@
 //! # {
 //! use std::str::FromStr;
 //!
+//! use ldk_node::bip39::Mnemonic;
 //! use ldk_node::bitcoin::secp256k1::PublicKey;
 //! use ldk_node::bitcoin::Network;
-//! use ldk_node::bip39::Mnemonic;
 //! use ldk_node::entropy::NodeEntropy;
 //! use ldk_node::lightning::ln::msgs::SocketAddress;
 //! use ldk_node::lightning_invoice::Bolt11Invoice;
