@@ -23,7 +23,7 @@ use electrsd::electrum_client::ElectrumApi;
 use ldk_node::{Event, Node};
 
 use super::external_node::ExternalNode;
-use super::{generate_blocks_and_wait, premine_and_distribute_funds};
+use super::{generate_blocks_and_wait, premine_and_distribute_funds, wait_for_tx};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Side {
@@ -87,15 +87,15 @@ pub(crate) async fn wait_for_htlcs_settled(
 	panic!("HTLCs did not settle on {} channel {} within 15s", peer.name(), ext_channel_id);
 }
 
-/// Build a fresh LDK node configured for interop tests. Uses electrum at the
+/// Build a fresh LDK node configured for interop tests. Uses esplora at the
 /// docker-compose default port and bumps sync timeouts for combo stress.
 pub(crate) fn setup_ldk_node() -> Node {
-	let config = crate::common::random_config(true);
+	let config = crate::common::random_config();
 	let mut builder = ldk_node::Builder::from_config(config.node_config);
-	let mut sync_config = ldk_node::config::ElectrumSyncConfig::default();
+	let mut sync_config = ldk_node::config::EsploraSyncConfig::default();
 	sync_config.timeouts_config.onchain_wallet_sync_timeout_secs = 180;
 	sync_config.timeouts_config.lightning_wallet_sync_timeout_secs = 120;
-	builder.set_chain_source_electrum("tcp://127.0.0.1:50001".to_string(), Some(sync_config));
+	builder.set_chain_source_esplora("http://127.0.0.1:3002".to_string(), Some(sync_config));
 	let node = builder.build(config.node_entropy).unwrap();
 	node.start().unwrap();
 	node
@@ -240,7 +240,8 @@ pub(crate) async fn splice_in_scenario<E: ElectrumApi>(
 	.await;
 	let ext_node_id = peer.get_node_id().await.unwrap();
 	node.splice_in(&user_ch, ext_node_id, 500_000).unwrap();
-	expect_splice_negotiated_event!(node, ext_node_id);
+	let splice_txo = expect_splice_negotiated_event!(node, ext_node_id);
+	wait_for_tx(electrs, splice_txo.txid).await;
 	generate_blocks_and_wait(bitcoind, electrs, 6).await;
 	sync_wallets_with_retry(node).await;
 	expect_channel_ready_event!(node, ext_node_id);

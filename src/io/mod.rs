@@ -7,12 +7,17 @@
 
 //! Objects and traits for data persistence.
 
-#[cfg(feature = "postgres")]
+#[cfg(feature = "storage-filesystem")]
+pub(crate) mod fs_store;
+#[cfg(feature = "storage-postgres")]
 pub mod postgres_store;
+#[cfg(feature = "storage-sqlite")]
 pub mod sqlite_store;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod tier_store;
 pub(crate) mod utils;
+#[cfg(feature = "storage-vss")]
 pub mod vss_store;
 
 /// The event queue will be persisted under this key.
@@ -79,6 +84,11 @@ pub(crate) const BDK_WALLET_TX_GRAPH_KEY: &str = "tx_graph";
 pub(crate) const BDK_WALLET_INDEXER_PRIMARY_NAMESPACE: &str = "bdk_wallet";
 pub(crate) const BDK_WALLET_INDEXER_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const BDK_WALLET_INDEXER_KEY: &str = "indexer";
+
+/// The derivation indices of the wallet's address pool will be persisted under this key.
+pub(crate) const BDK_WALLET_ADDRESS_POOL_PRIMARY_NAMESPACE: &str = "bdk_wallet";
+pub(crate) const BDK_WALLET_ADDRESS_POOL_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const BDK_WALLET_ADDRESS_POOL_KEY: &str = "address_pool";
 
 /// [`StaticInvoice`]s will be persisted under this key.
 ///

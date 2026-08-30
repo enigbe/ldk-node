@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_esplora::EsploraAsyncExt;
-use bitcoin::{FeeRate, Network, Script, Transaction, Txid};
+use bitcoin::transaction::Version;
+use bitcoin::{FeeRate, Network, Script, Txid};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
 use lightning_transaction_sync::EsploraSyncClient;
 
-use super::WalletSyncStatus;
+use super::{WalletSyncGuard, WalletSyncStatus};
 use crate::config::{
 	clamp_full_scan_stop_gap, Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
 	MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
@@ -28,6 +29,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_trace, log_warn, LdkLogger, Logger};
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, PersistedNodeMetrics};
 
@@ -54,16 +56,24 @@ impl EsploraChainSource {
 		let mut client_builder = esplora_client::Builder::new(&server_url);
 		client_builder =
 			client_builder.timeout(sync_config.timeouts_config.per_request_timeout_secs as u64);
+		let mut ldk_client_builder = ldk_esplora_client::Builder::new(&server_url);
+		ldk_client_builder = ldk_client_builder.timeout(Duration::from_secs(
+			sync_config.timeouts_config.per_request_timeout_secs as u64,
+		));
 
 		for (header_name, header_value) in &headers {
 			client_builder = client_builder.header(header_name, header_value);
+			ldk_client_builder = ldk_client_builder.header(header_name, header_value);
 		}
 
 		let esplora_client = client_builder.build_async().map_err(|e| {
 			log_error!(logger, "Failed to build Esplora client: {}", e);
 		})?;
+		let ldk_esplora_client = ldk_client_builder.build_async().map_err(|e| {
+			log_error!(logger, "Failed to build LDK Esplora client: {}", e);
+		})?;
 		let tx_sync =
-			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
+			Arc::new(EsploraSyncClient::from_client(ldk_esplora_client, Arc::clone(&logger)));
 
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
@@ -83,6 +93,31 @@ impl EsploraChainSource {
 		})
 	}
 
+	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		// This could still accept an Esplora server running against Bitcoin Core v26
+		// through v28, which does not relay ephemeral dust.
+		self.esplora_client.submit_package(&super::dummy_package(), None, None).await.map_err(
+			|e| {
+				if let esplora_client::Error::HttpResponse { status: 404, message } = e {
+					log_error!(
+						self.logger,
+						"Esplora server does not support submitpackage: {}",
+						message
+					);
+					Error::ChainSourceNotSupported
+				} else {
+					log_error!(
+						self.logger,
+						"Failed to check support for submitpackage on the Esplora server: {}",
+						e
+					);
+					Error::ConnectionFailed
+				}
+			},
+		)?;
+		Ok(())
+	}
+
 	pub(super) async fn sync_onchain_wallet(
 		&self, onchain_wallet: Arc<Wallet>,
 	) -> Result<(), Error> {
@@ -98,10 +133,12 @@ impl EsploraChainSource {
 				Error::WalletOperationFailed
 			})?;
 		}
+		let sync_guard =
+			WalletSyncGuard::new(&self.onchain_wallet_sync_status, Error::WalletOperationFailed);
 
 		let res = self.sync_onchain_wallet_inner(onchain_wallet).await;
 
-		self.onchain_wallet_sync_status.lock().expect("lock").propagate_result_to_subscribers(res);
+		sync_guard.complete(res);
 
 		res
 	}
@@ -119,7 +156,7 @@ impl EsploraChainSource {
 				let now = Instant::now();
 				match $sync_future.await {
 					Ok(res) => match res {
-						Ok(update) => match onchain_wallet.apply_update(update) {
+						Ok(update) => match onchain_wallet.apply_update(update).await {
 							Ok(()) => {
 								log_debug!(
 									self.logger,
@@ -248,14 +285,13 @@ impl EsploraChainSource {
 				Error::WalletOperationFailed
 			})?;
 		}
+		let sync_guard =
+			WalletSyncGuard::new(&self.lightning_wallet_sync_status, Error::WalletOperationFailed);
 
 		let res =
 			self.sync_lightning_wallet_inner(channel_manager, chain_monitor, output_sweeper).await;
 
-		self.lightning_wallet_sync_status
-			.lock()
-			.expect("lock")
-			.propagate_result_to_subscribers(res);
+		sync_guard.complete(res);
 
 		res
 	}
@@ -385,74 +421,111 @@ impl EsploraChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		for tx in &package {
-			let txid = tx.compute_txid();
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
-				self.esplora_client.broadcast(tx),
-			);
-			match timeout_fut.await {
-				Ok(res) => match res {
-					Ok(()) => {
-						log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
-					},
-					Err(e) => match e {
-						esplora_client::Error::HttpResponse { status, message } => {
-							if status == 400 {
-								// Log 400 at lesser level, as this often just means bitcoind already knows the
-								// transaction.
-								// FIXME: We can further differentiate here based on the error
-								// message which will be available with rust-esplora-client 0.7 and
-								// later.
-								log_trace!(
-									self.logger,
-									"Failed to broadcast due to HTTP connection error: {}",
-									message
-								);
-							} else {
-								log_error!(
-									self.logger,
-									"Failed to broadcast due to HTTP connection error: {} - {}",
-									status,
-									message
-								);
-							}
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-						},
-						_ => {
-							log_error!(
-								self.logger,
-								"Failed to broadcast transaction {}: {}",
-								txid,
-								e
-							);
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-						},
-					},
-				},
-				Err(e) => {
-					log_error!(
-						self.logger,
-						"Failed to broadcast transaction due to timeout {}: {}",
-						txid,
-						e
-					);
+	fn log_http_error(&self, e: esplora_client::Error, txids: &[Txid], txs: &SortedTransactions) {
+		match e {
+			esplora_client::Error::HttpResponse { status, message } => {
+				if status == 400 && txs.len() == 1 {
+					// Log 400 at lesser level, as this often just means bitcoind already knows the
+					// transaction.
+					// FIXME: We can further differentiate here based on the error
+					// message which will be available with rust-esplora-client 0.7 and
+					// later.
 					log_trace!(
 						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx.encode())
+						"Failed to broadcast due to HTTP connection error: {}",
+						message
 					);
-				},
-			}
+					log_trace!(self.logger, "Failed to broadcast transaction(s) {:?}", txids);
+				} else {
+					log_error!(
+						self.logger,
+						"Failed to broadcast due to HTTP connection error: {} - {}",
+						status,
+						message
+					);
+					log_error!(self.logger, "Failed to broadcast transaction(s) {:?}", txids);
+				}
+				log_trace!(self.logger, "Failed broadcast transaction(s) bytes:");
+				for tx in txs.iter() {
+					log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+				}
+			},
+			_ => {
+				log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+				log_trace!(self.logger, "Failed broadcast transaction(s) bytes:");
+				for tx in txs.iter() {
+					log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+				}
+			},
+		}
+	}
+
+	fn log_broadcast_error(
+		&self, e: impl core::fmt::Display, txids: &[Txid], txs: &SortedTransactions,
+	) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs.iter() {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => {
+				let txids: Vec<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+				let timeout_fut = tokio::time::timeout(
+					Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
+					self.esplora_client.submit_package(&txs, None, None),
+				);
+				match timeout_fut.await {
+					Ok(res) => match res {
+						Ok(result) => {
+							if result.package_msg.eq_ignore_ascii_case("success") {
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transactions {:?}",
+									txids
+								);
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transactions {:?}",
+									result
+								);
+							} else {
+								self.log_broadcast_error(format!("{:?}", result), &txids, &txs);
+							}
+						},
+						Err(e) => self.log_http_error(e, &txids, &txs),
+					},
+					Err(e) => self.log_broadcast_error(e, &txids, &txs),
+				}
+			},
+			_ => {
+				for tx in txs.iter() {
+					let txid = tx.compute_txid();
+					let timeout_fut = tokio::time::timeout(
+						Duration::from_secs(
+							self.sync_config.timeouts_config.tx_broadcast_timeout_secs,
+						),
+						self.esplora_client.broadcast(tx),
+					);
+					match timeout_fut.await {
+						Ok(res) => match res {
+							Ok(()) => {
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transaction {}",
+									txid
+								);
+							},
+							Err(e) => self.log_http_error(e, &[txid], &txs),
+						},
+						Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+					}
+				}
+			},
 		}
 	}
 }

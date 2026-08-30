@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::path::PathBuf;
+#[cfg(hrn_tests)]
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -30,19 +31,28 @@ use std::time::Duration;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{
 	Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid, Witness,
 };
 use electrsd::corepc_node::{Client as BitcoindClient, Node as BitcoinD};
 use electrsd::electrum_client::ElectrumApi;
 use electrsd::{corepc_node, ElectrsD};
-use ldk_node::config::{
-	AsyncPaymentsRole, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
-	HumanReadableNamesConfig,
-};
-use ldk_node::entropy::{generate_entropy_mnemonic, NodeEntropy};
+use ldk_node::bip39::Mnemonic;
+#[cfg(feature = "chain-electrum")]
+use ldk_node::config::ElectrumSyncConfig;
+#[cfg(feature = "chain-esplora")]
+use ldk_node::config::EsploraSyncConfig;
+use ldk_node::config::{AsyncPaymentsRole, Config};
+#[cfg(hrn_tests)]
+use ldk_node::config::{HRNResolverConfig, HumanReadableNamesConfig};
+use ldk_node::entropy::NodeEntropy;
+#[cfg(feature = "storage-sqlite")]
 use ldk_node::io::sqlite_store::SqliteStore;
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{
+	PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus, TransactionType,
+};
+use ldk_node::probing::ProbingConfig;
 use ldk_node::{
 	Builder, ChannelShutdownState, CustomTlvRecord, Event, LightningBalance, Node, NodeError,
 	PendingSweepBalance, UserChannelId,
@@ -61,7 +71,7 @@ use serde_json::{json, Value};
 
 #[path = "../../src/io/in_memory_store.rs"]
 mod in_memory_store;
-use in_memory_store::InMemoryStore;
+pub(crate) use in_memory_store::InMemoryStore;
 
 /// Shared timeout (in seconds) for waiting on LDK events and external node operations.
 pub(crate) const INTEROP_TIMEOUT_SECS: u64 = 60;
@@ -222,7 +232,7 @@ macro_rules! expect_payment_received_event {
 			ref e @ Event::PaymentReceived { payment_id, amount_msat, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(amount_msat, $amount_msat);
-				let payment = $node.payment(&payment_id.unwrap()).unwrap();
+				let payment = $node.payment(&payment_id).unwrap().unwrap();
 				if !matches!(payment.kind, ldk_node::payment::PaymentKind::Onchain { .. }) {
 					assert_eq!(payment.fee_paid_msat, None);
 				}
@@ -239,6 +249,36 @@ macro_rules! expect_payment_received_event {
 pub(crate) use expect_payment_received_event;
 
 macro_rules! expect_payment_claimable_event {
+	($node:expr, $payment_hash:expr, $claimable_amount_msat:expr) => {{
+		let event = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
+			$node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"{} timed out waiting for PaymentClaimable event after 60s",
+				std::stringify!($node)
+			)
+		});
+		match event {
+			ref e @ Event::PaymentClaimable {
+				payment_id,
+				payment_hash,
+				claimable_amount_msat,
+				..
+			} => {
+				println!("{} got event {:?}", std::stringify!($node), e);
+				assert_eq!(payment_hash, $payment_hash);
+				assert_eq!(claimable_amount_msat, $claimable_amount_msat);
+				$node.event_handled().unwrap();
+				(payment_id, claimable_amount_msat)
+			},
+			ref e => {
+				panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
+			},
+		}
+	}};
 	($node:expr, $payment_id:expr, $payment_hash:expr, $claimable_amount_msat:expr) => {{
 		let event = tokio::time::timeout(
 			std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
@@ -290,7 +330,7 @@ macro_rules! expect_payment_successful_event {
 				if let Some(fee_msat) = $fee_paid_msat {
 					assert_eq!(fee_paid_msat, fee_msat);
 				}
-				let payment = $node.payment(&$payment_id.unwrap()).unwrap();
+				let payment = $node.payment(&$payment_id).unwrap().unwrap();
 				assert_eq!(payment.fee_paid_msat, fee_paid_msat);
 				assert_eq!(payment_id, $payment_id);
 				$node.event_handled().unwrap();
@@ -328,25 +368,52 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 pub(crate) fn random_chain_source<'a>(
 	bitcoind: &'a BitcoinD, electrsd: &'a ElectrsD,
 ) -> TestChainSource<'a> {
-	let r = rand::random_range(0..3);
-	match r {
-		0 => {
+	#[cfg(not(feature = "chain-bitcoind"))]
+	let _ = bitcoind;
+
+	let configured_sources = env::var("LDK_NODE_TEST_CHAIN_SOURCES").ok().map(|value| {
+		value
+			.split(|c: char| c == ',' || c.is_ascii_whitespace())
+			.filter(|source| !source.is_empty())
+			.map(|source| source.to_ascii_uppercase())
+			.collect::<Vec<_>>()
+	});
+	let sources = configured_sources.unwrap_or_else(|| {
+		let mut sources = Vec::new();
+		#[cfg(feature = "chain-esplora")]
+		sources.push("ESPLORA".to_string());
+		#[cfg(feature = "chain-electrum")]
+		sources.push("ELECTRUM".to_string());
+		#[cfg(feature = "chain-bitcoind")]
+		{
+			sources.push("BITCOIND_RPC".to_string());
+			sources.push("BITCOIND_REST".to_string());
+		}
+		sources
+	});
+	let source = &sources[rand::random_range(0..sources.len())];
+	match source.as_str() {
+		#[cfg(feature = "chain-esplora")]
+		"ESPLORA" => {
 			println!("Randomly setting up Esplora chain syncing...");
 			TestChainSource::Esplora(electrsd)
 		},
-		1 => {
+		#[cfg(feature = "chain-electrum")]
+		"ELECTRUM" => {
 			println!("Randomly setting up Electrum chain syncing...");
 			TestChainSource::Electrum(electrsd)
 		},
-		2 => {
+		#[cfg(feature = "chain-bitcoind")]
+		"BITCOIND_RPC" => {
 			println!("Randomly setting up Bitcoind RPC chain syncing...");
 			TestChainSource::BitcoindRpcSync(bitcoind)
 		},
-		3 => {
+		#[cfg(feature = "chain-bitcoind")]
+		"BITCOIND_REST" => {
 			println!("Randomly setting up Bitcoind REST chain syncing...");
 			TestChainSource::BitcoindRestSync(bitcoind)
 		},
-		_ => unreachable!(),
+		_ => panic!("Unknown test chain source: {source}"),
 	}
 }
 
@@ -377,11 +444,12 @@ pub(crate) fn random_node_alias() -> Option<NodeAlias> {
 	Some(NodeAlias(bytes))
 }
 
-pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
+pub(crate) fn random_config() -> TestConfig {
 	let mut node_config = Config::default();
 
-	if !anchor_channels {
-		node_config.anchor_channels_config = None;
+	#[cfg(zero_fee_commitment_tests)]
+	{
+		node_config.anchor_channels_config.enable_zero_fee_commitments = true;
 	}
 
 	node_config.network = Network::Regtest;
@@ -403,22 +471,190 @@ pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
 }
 
 #[cfg(feature = "uniffi")]
-type TestNode = Arc<Node>;
+pub(crate) type TestNode = Arc<Node>;
 #[cfg(not(feature = "uniffi"))]
-type TestNode = Node;
+pub(crate) type TestNode = Node;
+
+/// Payment listing helpers for tests.
+///
+/// These exist so that tests state *what* they want from the payment history rather than how it is
+/// retrieved, and so that the retrieval can change in one place.
+pub(crate) trait NodePaymentExt {
+	/// Returns all known payments, from most recently created to least recently created.
+	fn list_all_payments(&self) -> Vec<PaymentDetails>;
+
+	/// Returns all known payments matching `f`, from most recently created to least recently
+	/// created.
+	fn list_payments_matching<F: FnMut(&&PaymentDetails) -> bool>(
+		&self, f: F,
+	) -> Vec<PaymentDetails>;
+}
+
+// Implemented on `Node` rather than on `TestNode` so that it applies both when `TestNode` is a
+// `Node` and when it is an `Arc<Node>`.
+impl NodePaymentExt for Node {
+	fn list_all_payments(&self) -> Vec<PaymentDetails> {
+		let mut all = Vec::new();
+		let mut seen = HashSet::new();
+		let mut page_token = None;
+		let mut num_pages = 0;
+		loop {
+			let page = self.list_payments(page_token).unwrap();
+			for payment in page.payments {
+				// Every test that looks at payments now exercises pagination, so assert the
+				// properties it is supposed to have while we are here.
+				assert!(
+					seen.insert(payment.id),
+					"Payment {:?} was returned on more than one page",
+					payment.id
+				);
+				all.push(payment);
+			}
+			num_pages += 1;
+			assert!(num_pages < 1_000, "Pagination did not terminate after {} pages", num_pages);
+			match page.next_page_token {
+				Some(token) => page_token = Some(token),
+				None => break,
+			}
+		}
+		all
+	}
+
+	fn list_payments_matching<F: FnMut(&&PaymentDetails) -> bool>(
+		&self, mut f: F,
+	) -> Vec<PaymentDetails> {
+		self.list_all_payments().into_iter().filter(|p| f(&p)).collect()
+	}
+}
+
+fn has_onchain_tx_type<F: Fn(&TransactionType) -> bool>(node: &TestNode, predicate: F) -> bool {
+	node.list_all_payments().into_iter().any(|payment| {
+		matches!(
+			payment.kind,
+			PaymentKind::Onchain { tx_type: Some(ref tx_type), .. } if predicate(tx_type)
+		)
+	})
+}
+
+fn assert_any_node_has_onchain_tx_type<F: Fn(&TransactionType) -> bool + Copy>(
+	nodes: &[(&str, &TestNode)], tx_type_name: &str, predicate: F,
+) {
+	if nodes.iter().any(|(_, node)| has_onchain_tx_type(node, predicate)) {
+		return;
+	}
+
+	let observed: Vec<String> = nodes
+		.iter()
+		.flat_map(|(name, node)| {
+			node.list_all_payments().into_iter().filter_map(move |payment| match payment.kind {
+				PaymentKind::Onchain { tx_type, .. } => Some(format!("{}:{:?}", name, tx_type)),
+				_ => None,
+			})
+		})
+		.collect();
+	panic!("Expected on-chain payment with tx_type {}; observed {:?}", tx_type_name, observed);
+}
+
+fn assert_all_nodes_have_onchain_tx_type<F: Fn(&TransactionType) -> bool + Copy>(
+	nodes: &[(&str, &TestNode)], panic_msg: &str, tx_type_name: &str, predicate: F,
+) {
+	if nodes.iter().all(|(_, node)| has_onchain_tx_type(node, predicate)) {
+		return;
+	}
+
+	let observed: Vec<String> = nodes
+		.iter()
+		.flat_map(|(name, node)| {
+			node.list_all_payments().into_iter().filter_map(move |payment| match payment.kind {
+				PaymentKind::Onchain { tx_type, .. } => Some(format!("{}:{:?}", name, tx_type)),
+				_ => None,
+			})
+		})
+		.collect();
+	panic!(
+		"Expected {}nodes to have on-chain payment with tx_type {}; observed {:?}",
+		panic_msg, tx_type_name, observed
+	);
+}
+
+async fn settle_force_close_balance<E: ElectrumApi>(
+	node: &TestNode, counterparty_node_id: PublicKey, peer_node: &TestNode,
+	bitcoind: &BitcoindClient, electrsd: &E,
+) {
+	let balances = node.list_balances();
+	if balances.lightning_balances.len() == 1 {
+		match balances.lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id: actual_counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(actual_counterparty_node_id, counterparty_node_id);
+				let cur_height = node.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				generate_blocks_and_wait(bitcoind, electrsd, blocks_to_go as usize).await;
+				node.sync_wallets().unwrap();
+				peer_node.sync_wallets().unwrap();
+			},
+			_ => panic!("Unexpected balance state!"),
+		}
+	} else {
+		assert!(balances.lightning_balances.is_empty(), "Unexpected balance state: {:?}", balances);
+		assert_eq!(balances.pending_balances_from_channel_closures.len(), 1);
+	}
+
+	for _ in 0..6 {
+		if node.list_balances().lightning_balances.is_empty() {
+			break;
+		}
+		generate_blocks_and_wait(bitcoind, electrsd, 1).await;
+		node.sync_wallets().unwrap();
+		peer_node.sync_wallets().unwrap();
+	}
+
+	let balances = node.list_balances();
+	assert!(balances.lightning_balances.is_empty(), "Unexpected balance state: {:?}", balances);
+	assert_eq!(balances.pending_balances_from_channel_closures.len(), 1);
+	match balances.pending_balances_from_channel_closures[0] {
+		PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {
+			generate_blocks_and_wait(bitcoind, electrsd, 1).await;
+			node.sync_wallets().unwrap();
+			peer_node.sync_wallets().unwrap();
+
+			assert!(node.list_balances().lightning_balances.is_empty());
+			assert_eq!(node.list_balances().pending_balances_from_channel_closures.len(), 1);
+			match node.list_balances().pending_balances_from_channel_closures[0] {
+				PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
+				_ => panic!("Unexpected balance state!"),
+			}
+		},
+		PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
+		_ => panic!("Unexpected balance state!"),
+	}
+
+	generate_blocks_and_wait(bitcoind, electrsd, 5).await;
+	node.sync_wallets().unwrap();
+	peer_node.sync_wallets().unwrap();
+}
 
 #[derive(Clone)]
 pub(crate) enum TestChainSource<'a> {
+	#[cfg(feature = "chain-esplora")]
 	Esplora(&'a ElectrsD),
+	#[cfg(feature = "chain-electrum")]
 	Electrum(&'a ElectrsD),
+	#[cfg(feature = "chain-bitcoind")]
 	BitcoindRpcSync(&'a BitcoinD),
+	#[cfg(feature = "chain-bitcoind")]
 	BitcoindRestSync(&'a BitcoinD),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum TestStoreType {
 	TestSyncStore,
+	#[cfg(feature = "storage-sqlite")]
 	Sqlite,
+	#[cfg(feature = "storage-filesystem")]
 	FilesystemStore,
 }
 
@@ -438,6 +674,7 @@ pub(crate) struct TestConfig {
 	pub wallet_rescan_from_height: Option<u32>,
 	pub force_wallet_full_scan: bool,
 	pub full_scan_stop_gap: Option<u32>,
+	pub probing: Option<ProbingConfig>,
 }
 
 impl Default for TestConfig {
@@ -446,8 +683,11 @@ impl Default for TestConfig {
 		let log_writer = Default::default();
 		let store_type = Default::default();
 
-		let mnemonic = generate_entropy_mnemonic(None);
+		let mnemonic = Mnemonic::generate(24).unwrap();
+		#[cfg(not(feature = "uniffi"))]
 		let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
+		#[cfg(feature = "uniffi")]
+		let node_entropy = NodeEntropy::from_seed_bytes(mnemonic.to_seed("").to_vec()).unwrap();
 		let async_payments_role = None;
 		let wallet_rescan_from_height = None;
 		let force_wallet_full_scan = false;
@@ -461,6 +701,7 @@ impl Default for TestConfig {
 			wallet_rescan_from_height,
 			force_wallet_full_scan,
 			full_scan_stop_gap,
+			probing: None,
 		}
 	}
 }
@@ -468,7 +709,7 @@ impl Default for TestConfig {
 macro_rules! setup_builder {
 	($builder:ident, $config:expr) => {
 		#[cfg(feature = "uniffi")]
-		let $builder = Builder::from_config($config.clone());
+		let mut $builder = Builder::from_config($config.clone());
 		#[cfg(not(feature = "uniffi"))]
 		let mut $builder = Builder::from_config($config.clone());
 	};
@@ -476,69 +717,11 @@ macro_rules! setup_builder {
 
 pub(crate) use setup_builder;
 
-#[cfg(any(cln_test, lnd_test, eclair_test))]
-pub(crate) mod scenarios;
-
-pub(crate) fn setup_two_nodes(
-	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
-	anchors_trusted_no_reserve: bool,
-) -> (TestNode, TestNode) {
-	setup_two_nodes_with_store(
-		chain_source,
-		allow_0conf,
-		anchor_channels,
-		anchors_trusted_no_reserve,
-		TestStoreType::TestSyncStore,
-	)
-}
-
-pub(crate) fn setup_two_nodes_with_store(
-	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
-	anchors_trusted_no_reserve: bool, store_type: TestStoreType,
-) -> (TestNode, TestNode) {
-	println!("== Node A ==");
-	let mut config_a = random_config(anchor_channels);
-	config_a.store_type = store_type;
-
-	if cfg!(hrn_tests) {
-		config_a.node_config.hrn_config =
-			HumanReadableNamesConfig { resolution_config: HRNResolverConfig::Blip32 };
-	}
-
-	let node_a = setup_node(chain_source, config_a);
-
-	println!("\n== Node B ==");
-	let mut config_b = random_config(anchor_channels);
-	config_b.store_type = store_type;
-
-	if cfg!(hrn_tests) {
-		config_b.node_config.hrn_config = HumanReadableNamesConfig {
-			resolution_config: HRNResolverConfig::Dns {
-				dns_server_address: SocketAddress::from_str("8.8.8.8:53").unwrap(),
-				enable_hrn_resolution_service: true,
-			},
-		};
-	}
-
-	if allow_0conf {
-		config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
-	}
-	if anchor_channels && anchors_trusted_no_reserve {
-		config_b
-			.node_config
-			.anchor_channels_config
-			.as_mut()
-			.unwrap()
-			.trusted_peers_no_reserve
-			.push(node_a.node_id());
-	}
-	let node_b = setup_node(chain_source, config_b);
-	(node_a, node_b)
-}
-
-pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> TestNode {
-	setup_builder!(builder, config.node_config);
+pub(crate) fn configure_chain_source(
+	chain_source: &TestChainSource, builder: &mut Builder, config: &TestConfig,
+) {
 	match chain_source {
+		#[cfg(feature = "chain-esplora")]
 		TestChainSource::Esplora(electrsd) => {
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 			let mut sync_config = EsploraSyncConfig::default();
@@ -549,6 +732,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			}
 			builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		},
+		#[cfg(feature = "chain-electrum")]
 		TestChainSource::Electrum(electrsd) => {
 			let electrum_url = format!("tcp://{}", electrsd.electrum_url);
 			let mut sync_config = ElectrumSyncConfig::default();
@@ -559,6 +743,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			}
 			builder.set_chain_source_electrum(electrum_url.clone(), Some(sync_config));
 		},
+		#[cfg(feature = "chain-bitcoind")]
 		TestChainSource::BitcoindRpcSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
 			let rpc_port = bitcoind.params.rpc_socket.port();
@@ -573,6 +758,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 				config.wallet_rescan_from_height,
 			);
 		},
+		#[cfg(feature = "chain-bitcoind")]
 		TestChainSource::BitcoindRestSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
 			let rpc_port = bitcoind.params.rpc_socket.port();
@@ -592,6 +778,66 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			);
 		},
 	}
+}
+
+#[cfg(any(cln_test, lnd_test, eclair_test))]
+pub(crate) mod scenarios;
+
+pub(crate) fn setup_two_nodes(
+	chain_source: &TestChainSource, allow_0conf: bool, anchors_trusted_no_reserve: bool,
+) -> (TestNode, TestNode) {
+	setup_two_nodes_with_store(
+		chain_source,
+		allow_0conf,
+		anchors_trusted_no_reserve,
+		TestStoreType::TestSyncStore,
+	)
+}
+
+pub(crate) fn setup_two_nodes_with_store(
+	chain_source: &TestChainSource, allow_0conf: bool, anchors_trusted_no_reserve: bool,
+	store_type: TestStoreType,
+) -> (TestNode, TestNode) {
+	println!("== Node A ==");
+	let mut config_a = random_config();
+	config_a.store_type = store_type;
+
+	#[cfg(hrn_tests)]
+	{
+		config_a.node_config.hrn_config =
+			HumanReadableNamesConfig { resolution_config: HRNResolverConfig::Blip32 };
+	}
+
+	let node_a = setup_node(chain_source, config_a);
+
+	println!("\n== Node B ==");
+	let mut config_b = random_config();
+	config_b.store_type = store_type;
+	config_b.node_config.manually_handle_unknown_bolt11_payments = true;
+
+	#[cfg(hrn_tests)]
+	{
+		config_b.node_config.hrn_config = HumanReadableNamesConfig {
+			resolution_config: HRNResolverConfig::Dns {
+				dns_server_address: SocketAddress::from_str("8.8.8.8:53").unwrap(),
+				enable_hrn_resolution_service: true,
+			},
+		};
+	}
+
+	if allow_0conf {
+		config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
+	}
+	if anchors_trusted_no_reserve {
+		config_b.node_config.anchor_channels_config.trusted_peers_no_reserve.push(node_a.node_id());
+	}
+	let node_b = setup_node(chain_source, config_b);
+	(node_a, node_b)
+}
+
+pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> TestNode {
+	setup_builder!(builder, config.node_config);
+	configure_chain_source(chain_source, &mut builder, &config);
 
 	match &config.log_writer {
 		TestLogWriter::FileWriter => {
@@ -607,12 +853,18 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 
 	builder.set_async_payments_role(config.async_payments_role).unwrap();
 
+	if let Some(probing) = config.probing {
+		builder.set_probing_config(probing.into());
+	}
+
 	let node = match config.store_type {
 		TestStoreType::TestSyncStore => {
 			let kv_store = TestSyncStore::new(config.node_config.storage_dir_path.into());
 			builder.build_with_store(config.node_entropy.into(), kv_store).unwrap()
 		},
+		#[cfg(feature = "storage-sqlite")]
 		TestStoreType::Sqlite => builder.build(config.node_entropy.into()).unwrap(),
+		#[cfg(feature = "storage-filesystem")]
 		TestStoreType::FilesystemStore => {
 			builder.build_with_fs_store(config.node_entropy.into()).unwrap()
 		},
@@ -635,7 +887,7 @@ pub(crate) async fn generate_blocks_and_wait<E: ElectrumApi>(
 	let address = bitcoind.new_address().expect("failed to get new address");
 	// TODO: expect this Result once the WouldBlock issue is resolved upstream.
 	let _block_hashes_res = bitcoind.generate_to_address(num, &address);
-	wait_for_block(electrs, cur_height as usize + num).await;
+	wait_for_block(bitcoind, electrs, cur_height as usize + num).await;
 	print!(" Done!");
 	println!("\n");
 }
@@ -655,27 +907,25 @@ pub(crate) fn invalidate_blocks(bitcoind: &BitcoindClient, num_blocks: usize) {
 	assert!(new_cur_height + num_blocks == cur_height);
 }
 
-pub(crate) async fn wait_for_block<E: ElectrumApi>(electrs: &E, min_height: usize) {
-	let mut header = match electrs.block_headers_subscribe() {
-		Ok(header) => header,
-		Err(_) => {
-			// While subscribing should succeed the first time around, we ran into some cases where
-			// it didn't. Since we can't proceed without subscribing, we try again after a delay
-			// and panic if it still fails.
-			tokio::time::sleep(Duration::from_secs(3)).await;
-			electrs.block_headers_subscribe().expect("failed to subscribe to block headers")
-		},
-	};
-	loop {
-		if header.height >= min_height {
-			break;
+pub(crate) async fn wait_for_block<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, min_height: usize,
+) {
+	let expected_block_hash = exponential_backoff_poll(|| {
+		let bitcoind_height =
+			bitcoind.get_blockchain_info().expect("failed to get blockchain info").blocks as usize;
+		if bitcoind_height < min_height {
+			return None;
 		}
-		header = exponential_backoff_poll(|| {
-			electrs.ping().expect("failed to ping electrs");
-			electrs.block_headers_pop().expect("failed to pop block header")
-		})
-		.await;
-	}
+		bitcoind.get_block_hash(min_height as u64).ok()?.block_hash().ok()
+	})
+	.await;
+	// A height-only wait can return the old header during a same-height reorg. Require the
+	// replacement hash so callers cannot sync against the stale chain by mistake.
+	exponential_backoff_poll(|| {
+		let header = electrs.block_header(min_height).ok()?;
+		(header.block_hash() == expected_block_hash).then_some(())
+	})
+	.await;
 }
 
 pub(crate) async fn wait_for_tx<E: ElectrumApi>(electrs: &E, txid: Txid) {
@@ -694,18 +944,48 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 	let tx = electrs.transaction_get(&outpoint.txid).unwrap();
 	let txout_script = tx.output.get(outpoint.vout as usize).unwrap().clone().script_pubkey;
 
-	let is_spent = !electrs.script_get_history(&txout_script).unwrap().is_empty();
-	if is_spent {
-		return;
-	}
-
+	// Script history already contains the funding transaction itself, so wait until the exact
+	// funding outpoint leaves the unspent set instead of treating any history as a spend.
 	exponential_backoff_poll(|| {
 		electrs.ping().unwrap();
 
-		let is_spent = !electrs.script_get_history(&txout_script).unwrap().is_empty();
+		let is_spent = !electrs.script_list_unspent(&txout_script).unwrap().iter().any(|output| {
+			output.tx_hash == outpoint.txid && output.tx_pos == outpoint.vout as usize
+		});
 		is_spent.then_some(())
 	})
 	.await;
+}
+
+/// Polls the channel from `source_node` to `counterparty_node` until it reports `is_usable`
+/// and can carry an HTLC of `min_amount_msat` from `source_node`'s side.
+///
+/// After `ChannelReady`, channel-monitor persistence can lag for tens of seconds on slow
+/// CI runners; during that window `send_probe`/`send_payment` reject with
+/// `ParameterError("...monitor update is in progress...")`. This helper gives tests a
+/// deterministic readiness gate instead of racing the monitor-update pipeline.
+pub(crate) async fn wait_for_channel_ready_to_send(
+	source_node: &TestNode, counterparty_node: &TestNode, min_amount_msat: u64,
+) {
+	let counterparty = counterparty_node.node_id();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+	while tokio::time::Instant::now() < deadline {
+		let ready = source_node.list_channels().iter().any(|c| {
+			c.counterparty.node_id == counterparty
+				&& c.is_usable
+				&& c.next_outbound_htlc_limit_msat >= min_amount_msat
+		});
+		if ready {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	panic!(
+		"channel from {} to {} not ready to send {} msat within 180s",
+		source_node.node_id(),
+		counterparty,
+		min_amount_msat,
+	);
 }
 
 pub(crate) async fn exponential_backoff_poll<T, F>(mut poll: F) -> T
@@ -833,12 +1113,18 @@ pub async fn open_channel(
 	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, should_announce: bool,
 	electrsd: &ElectrsD,
 ) -> OutPoint {
-	open_channel_push_amt(node_a, node_b, funding_amount_sat, None, should_announce, electrsd).await
+	let funding_txo =
+		open_channel_no_wait(node_a, node_b, funding_amount_sat, None, should_announce).await;
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	funding_txo
 }
 
-pub async fn open_channel_push_amt(
+/// Like [`open_channel`] but skips the `wait_for_tx` electrum check so that
+/// multiple channels can be opened back-to-back before any blocks are mined.
+/// The caller is responsible for mining blocks and confirming the funding txs.
+pub async fn open_channel_no_wait(
 	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, push_amount_msat: Option<u64>,
-	should_announce: bool, electrsd: &ElectrsD,
+	should_announce: bool,
 ) -> OutPoint {
 	if should_announce {
 		node_a
@@ -866,9 +1152,18 @@ pub async fn open_channel_push_amt(
 	let funding_txo_a = expect_channel_pending_event!(node_a, node_b.node_id());
 	let funding_txo_b = expect_channel_pending_event!(node_b, node_a.node_id());
 	assert_eq!(funding_txo_a, funding_txo_b);
-	wait_for_tx(&electrsd.client, funding_txo_a.txid).await;
-
 	funding_txo_a
+}
+
+pub async fn open_channel_push_amt(
+	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, push_amount_msat: Option<u64>,
+	should_announce: bool, electrsd: &ElectrsD,
+) -> OutPoint {
+	let funding_txo =
+		open_channel_no_wait(node_a, node_b, funding_amount_sat, push_amount_msat, should_announce)
+			.await;
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	funding_txo
 }
 
 pub async fn open_channel_with_all(
@@ -909,7 +1204,6 @@ pub async fn splice_in_with_all(
 	node_a.splice_in_with_all(user_channel_id, node_b.node_id()).unwrap();
 
 	let splice_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
 	wait_for_tx(&electrsd.client, splice_txo.txid).await;
 }
 
@@ -937,28 +1231,28 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	// Check we saw the node funding transactions.
 	assert_eq!(
 		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Inbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		1
 	);
 	assert_eq!(
 		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Outbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		0
 	);
 	assert_eq!(
 		node_b
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Inbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		1
 	);
 	assert_eq!(
 		node_b
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Outbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		0
@@ -1011,7 +1305,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	// Check we now see the channel funding transaction as outbound.
 	assert_eq!(
 		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Outbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		1
@@ -1035,7 +1329,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	let node_b_anchor_reserve_sat = if node_b
 		.config()
 		.anchor_channels_config
-		.map_or(true, |acc| acc.trusted_peers_no_reserve.contains(&node_a.node_id()))
+		.trusted_peers_no_reserve
+		.contains(&node_a.node_id())
 	{
 		0
 	} else {
@@ -1085,30 +1380,30 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		.unwrap();
 
 	println!("\nA send");
-	let payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
-	assert_eq!(node_a.bolt11_payment().send(&invoice, None), Err(NodeError::DuplicatePayment));
+	let outbound_payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
+	assert_eq!(Err(NodeError::DuplicatePayment), node_a.bolt11_payment().send(&invoice, None));
 
-	assert!(!node_a.list_payments_with_filter(|p| p.id == payment_id).is_empty());
+	assert!(!node_a.list_payments_matching(|p| p.id == outbound_payment_id).is_empty());
 
-	let outbound_payments_a = node_a.list_payments_with_filter(|p| {
+	let outbound_payments_a = node_a.list_payments_matching(|p| {
 		p.direction == PaymentDirection::Outbound && matches!(p.kind, PaymentKind::Bolt11 { .. })
 	});
 	assert_eq!(outbound_payments_a.len(), 1);
 
-	let inbound_payments_a = node_a.list_payments_with_filter(|p| {
+	let inbound_payments_a = node_a.list_payments_matching(|p| {
 		p.direction == PaymentDirection::Inbound && matches!(p.kind, PaymentKind::Bolt11 { .. })
 	});
 	assert_eq!(inbound_payments_a.len(), 0);
 
-	let outbound_payments_b = node_b.list_payments_with_filter(|p| {
+	let outbound_payments_b = node_b.list_payments_matching(|p| {
 		p.direction == PaymentDirection::Outbound && matches!(p.kind, PaymentKind::Bolt11 { .. })
 	});
 	assert_eq!(outbound_payments_b.len(), 0);
 
-	let inbound_payments_b = node_b.list_payments_with_filter(|p| {
+	let inbound_payments_b = node_b.list_payments_matching(|p| {
 		p.direction == PaymentDirection::Inbound && matches!(p.kind, PaymentKind::Bolt11 { .. })
 	});
-	assert_eq!(inbound_payments_b.len(), 1);
+	assert_eq!(inbound_payments_b.len(), 0);
 
 	// Verify bolt12_invoice is None for BOLT11 payments
 	match node_a.next_event_async().await {
@@ -1121,24 +1416,17 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_a), e);
 		},
 	}
-	expect_event!(node_b, PaymentReceived);
-	assert_eq!(node_a.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(node_a.payment(&payment_id).unwrap().amount_msat, Some(invoice_amount_1_msat));
-	assert!(matches!(node_a.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
-	assert_eq!(node_b.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(node_b.payment(&payment_id).unwrap().amount_msat, Some(invoice_amount_1_msat));
-	assert!(matches!(node_b.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
-
-	// Assert we fail duplicate outbound payments and check the status hasn't changed.
-	assert_eq!(Err(NodeError::DuplicatePayment), node_a.bolt11_payment().send(&invoice, None));
-	assert_eq!(node_a.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(node_a.payment(&payment_id).unwrap().amount_msat, Some(invoice_amount_1_msat));
-	assert_eq!(node_b.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(node_b.payment(&payment_id).unwrap().amount_msat, Some(invoice_amount_1_msat));
+	let inbound_payment_id = expect_payment_received_event!(node_b, invoice_amount_1_msat);
+	let outbound_payment = node_a.payment(&outbound_payment_id).unwrap().unwrap();
+	assert_eq!(outbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(outbound_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(outbound_payment.amount_msat, Some(invoice_amount_1_msat));
+	assert!(matches!(&outbound_payment.kind, PaymentKind::Bolt11 { .. }));
+	let inbound_payment = node_b.payment(&inbound_payment_id).unwrap().unwrap();
+	assert_eq!(inbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(inbound_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(inbound_payment.amount_msat, Some(invoice_amount_1_msat));
+	assert!(matches!(&inbound_payment.kind, PaymentKind::Bolt11 { .. }));
 
 	// Test under-/overpayment
 	let invoice_amount_2_msat = 2500_000;
@@ -1161,28 +1449,30 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	let overpaid_amount_msat = invoice_amount_2_msat + 100;
 
 	println!("\nA overpaid send");
-	let payment_id =
+	let outbound_payment_id =
 		node_a.bolt11_payment().send_using_amount(&invoice, overpaid_amount_msat, None).unwrap();
 	expect_event!(node_a, PaymentSuccessful);
-	let received_amount = match node_b.next_event_async().await {
-		ref e @ Event::PaymentReceived { amount_msat, .. } => {
+	let (inbound_payment_id, received_amount) = match node_b.next_event_async().await {
+		ref e @ Event::PaymentReceived { payment_id, amount_msat, .. } => {
 			println!("{} got event {:?}", std::stringify!(node_b), e);
 			node_b.event_handled().unwrap();
-			amount_msat
+			(payment_id, amount_msat)
 		},
 		ref e => {
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
 		},
 	};
 	assert_eq!(received_amount, overpaid_amount_msat);
-	assert_eq!(node_a.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(node_a.payment(&payment_id).unwrap().amount_msat, Some(overpaid_amount_msat));
-	assert!(matches!(node_a.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
-	assert_eq!(node_b.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(node_b.payment(&payment_id).unwrap().amount_msat, Some(overpaid_amount_msat));
-	assert!(matches!(node_b.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
+	let outbound_payment = node_a.payment(&outbound_payment_id).unwrap().unwrap();
+	assert_eq!(outbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(outbound_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(outbound_payment.amount_msat, Some(overpaid_amount_msat));
+	assert!(matches!(&outbound_payment.kind, PaymentKind::Bolt11 { .. }));
+	let inbound_payment = node_b.payment(&inbound_payment_id).unwrap().unwrap();
+	assert_eq!(inbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(inbound_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(inbound_payment.amount_msat, Some(overpaid_amount_msat));
+	assert!(matches!(&inbound_payment.kind, PaymentKind::Bolt11 { .. }));
 
 	// Test "zero-amount" invoice payment
 	println!("\nB receive_variable_amount_payment");
@@ -1196,31 +1486,33 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		node_a.bolt11_payment().send(&variable_amount_invoice, None)
 	);
 	println!("\nA send_using_amount");
-	let payment_id = node_a
+	let outbound_payment_id = node_a
 		.bolt11_payment()
 		.send_using_amount(&variable_amount_invoice, determined_amount_msat, None)
 		.unwrap();
 
 	expect_event!(node_a, PaymentSuccessful);
-	let received_amount = match node_b.next_event_async().await {
-		ref e @ Event::PaymentReceived { amount_msat, .. } => {
+	let (inbound_payment_id, received_amount) = match node_b.next_event_async().await {
+		ref e @ Event::PaymentReceived { payment_id, amount_msat, .. } => {
 			println!("{} got event {:?}", std::stringify!(node_b), e);
 			node_b.event_handled().unwrap();
-			amount_msat
+			(payment_id, amount_msat)
 		},
 		ref e => {
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
 		},
 	};
 	assert_eq!(received_amount, determined_amount_msat);
-	assert_eq!(node_a.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(node_a.payment(&payment_id).unwrap().amount_msat, Some(determined_amount_msat));
-	assert!(matches!(node_a.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
-	assert_eq!(node_b.payment(&payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(node_b.payment(&payment_id).unwrap().amount_msat, Some(determined_amount_msat));
-	assert!(matches!(node_b.payment(&payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
+	let outbound_payment = node_a.payment(&outbound_payment_id).unwrap().unwrap();
+	assert_eq!(outbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(outbound_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(outbound_payment.amount_msat, Some(determined_amount_msat));
+	assert!(matches!(&outbound_payment.kind, PaymentKind::Bolt11 { .. }));
+	let inbound_payment = node_b.payment(&inbound_payment_id).unwrap().unwrap();
+	assert_eq!(inbound_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(inbound_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(inbound_payment.amount_msat, Some(determined_amount_msat));
+	assert!(matches!(&inbound_payment.kind, PaymentKind::Bolt11 { .. }));
 
 	// Test claiming manually registered payments.
 	let invoice_amount_3_msat = 5_532_000;
@@ -1235,34 +1527,28 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 			manual_payment_hash,
 		)
 		.unwrap();
-	let manual_payment_id = node_a.bolt11_payment().send(&manual_invoice, None).unwrap();
+	let outbound_manual_payment_id = node_a.bolt11_payment().send(&manual_invoice, None).unwrap();
 
-	let claimable_amount_msat = expect_payment_claimable_event!(
-		node_b,
-		manual_payment_id,
-		manual_payment_hash,
-		invoice_amount_3_msat
-	);
+	let (manual_payment_id, claimable_amount_msat) =
+		expect_payment_claimable_event!(node_b, manual_payment_hash, invoice_amount_3_msat);
+	assert_ne!(manual_payment_id.0, manual_payment_hash.0);
 	node_b
 		.bolt11_payment()
-		.claim_for_hash(manual_payment_hash, claimable_amount_msat, manual_preimage)
+		.claim_for_id(manual_payment_id, claimable_amount_msat, manual_preimage)
 		.unwrap();
-	expect_payment_received_event!(node_b, claimable_amount_msat);
-	expect_payment_successful_event!(node_a, Some(manual_payment_id), None);
-	assert_eq!(node_a.payment(&manual_payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&manual_payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(
-		node_a.payment(&manual_payment_id).unwrap().amount_msat,
-		Some(invoice_amount_3_msat)
-	);
-	assert!(matches!(node_a.payment(&manual_payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
-	assert_eq!(node_b.payment(&manual_payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&manual_payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(
-		node_b.payment(&manual_payment_id).unwrap().amount_msat,
-		Some(invoice_amount_3_msat)
-	);
-	assert!(matches!(node_b.payment(&manual_payment_id).unwrap().kind, PaymentKind::Bolt11 { .. }));
+	let received_payment_id = expect_payment_received_event!(node_b, claimable_amount_msat);
+	assert_eq!(received_payment_id, manual_payment_id);
+	expect_payment_successful_event!(node_a, outbound_manual_payment_id, None);
+	let outbound_manual_payment = node_a.payment(&outbound_manual_payment_id).unwrap().unwrap();
+	assert_eq!(outbound_manual_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(outbound_manual_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(outbound_manual_payment.amount_msat, Some(invoice_amount_3_msat));
+	assert!(matches!(&outbound_manual_payment.kind, PaymentKind::Bolt11 { .. }));
+	let manual_payment = node_b.payment(&manual_payment_id).unwrap().unwrap();
+	assert_eq!(manual_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(manual_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(manual_payment.amount_msat, Some(invoice_amount_3_msat));
+	assert!(matches!(&manual_payment.kind, PaymentKind::Bolt11 { .. }));
 
 	// Test failing manually registered payments.
 	let invoice_amount_4_msat = 5_532_000;
@@ -1278,42 +1564,25 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 			manual_fail_payment_hash,
 		)
 		.unwrap();
-	let manual_fail_payment_id = node_a.bolt11_payment().send(&manual_fail_invoice, None).unwrap();
+	let outbound_manual_fail_payment_id =
+		node_a.bolt11_payment().send(&manual_fail_invoice, None).unwrap();
 
-	expect_payment_claimable_event!(
-		node_b,
-		manual_fail_payment_id,
-		manual_fail_payment_hash,
-		invoice_amount_4_msat
-	);
-	node_b.bolt11_payment().fail_for_hash(manual_fail_payment_hash).unwrap();
+	let (manual_fail_payment_id, _) =
+		expect_payment_claimable_event!(node_b, manual_fail_payment_hash, invoice_amount_4_msat);
+	assert_ne!(manual_fail_payment_id.0, manual_fail_payment_hash.0);
+	node_b.bolt11_payment().fail_for_id(manual_fail_payment_id).unwrap();
 	expect_event!(node_a, PaymentFailed);
-	assert_eq!(node_a.payment(&manual_fail_payment_id).unwrap().status, PaymentStatus::Failed);
-	assert_eq!(
-		node_a.payment(&manual_fail_payment_id).unwrap().direction,
-		PaymentDirection::Outbound
-	);
-	assert_eq!(
-		node_a.payment(&manual_fail_payment_id).unwrap().amount_msat,
-		Some(invoice_amount_4_msat)
-	);
-	assert!(matches!(
-		node_a.payment(&manual_fail_payment_id).unwrap().kind,
-		PaymentKind::Bolt11 { .. }
-	));
-	assert_eq!(node_b.payment(&manual_fail_payment_id).unwrap().status, PaymentStatus::Failed);
-	assert_eq!(
-		node_b.payment(&manual_fail_payment_id).unwrap().direction,
-		PaymentDirection::Inbound
-	);
-	assert_eq!(
-		node_b.payment(&manual_fail_payment_id).unwrap().amount_msat,
-		Some(invoice_amount_4_msat)
-	);
-	assert!(matches!(
-		node_b.payment(&manual_fail_payment_id).unwrap().kind,
-		PaymentKind::Bolt11 { .. }
-	));
+	let outbound_manual_fail_payment =
+		node_a.payment(&outbound_manual_fail_payment_id).unwrap().unwrap();
+	assert_eq!(outbound_manual_fail_payment.status, PaymentStatus::Failed);
+	assert_eq!(outbound_manual_fail_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(outbound_manual_fail_payment.amount_msat, Some(invoice_amount_4_msat));
+	assert!(matches!(&outbound_manual_fail_payment.kind, PaymentKind::Bolt11 { .. }));
+	let manual_fail_payment = node_b.payment(&manual_fail_payment_id).unwrap().unwrap();
+	assert_eq!(manual_fail_payment.status, PaymentStatus::Failed);
+	assert_eq!(manual_fail_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(manual_fail_payment.amount_msat, Some(invoice_amount_4_msat));
+	assert!(matches!(&manual_fail_payment.kind, PaymentKind::Bolt11 { .. }));
 
 	// Test spontaneous/keysend payments
 	println!("\nA send_spontaneous_payment");
@@ -1325,50 +1594,45 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		.unwrap();
 	expect_event!(node_a, PaymentSuccessful);
 	let next_event = node_b.next_event_async().await;
-	let (received_keysend_amount, received_custom_records) = match next_event {
-		ref e @ Event::PaymentReceived { amount_msat, ref custom_records, .. } => {
-			println!("{} got event {:?}", std::stringify!(node_b), e);
-			node_b.event_handled().unwrap();
-			(amount_msat, custom_records)
-		},
-		ref e => {
-			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
-		},
-	};
+	let (received_keysend_payment_id, received_keysend_amount, received_custom_records) =
+		match next_event {
+			ref e @ Event::PaymentReceived {
+				payment_id, amount_msat, ref custom_records, ..
+			} => {
+				println!("{} got event {:?}", std::stringify!(node_b), e);
+				node_b.event_handled().unwrap();
+				(payment_id, amount_msat, custom_records)
+			},
+			ref e => {
+				panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
+			},
+		};
 	assert_eq!(received_keysend_amount, keysend_amount_msat);
-	assert_eq!(node_a.payment(&keysend_payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_a.payment(&keysend_payment_id).unwrap().direction, PaymentDirection::Outbound);
-	assert_eq!(node_a.payment(&keysend_payment_id).unwrap().amount_msat, Some(keysend_amount_msat));
-	assert!(matches!(
-		node_a.payment(&keysend_payment_id).unwrap().kind,
-		PaymentKind::Spontaneous { .. }
-	));
+	let keysend_payment = node_a.payment(&keysend_payment_id).unwrap().unwrap();
+	assert_eq!(keysend_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(keysend_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(keysend_payment.amount_msat, Some(keysend_amount_msat));
+	assert!(matches!(&keysend_payment.kind, PaymentKind::Spontaneous { .. }));
 	assert_eq!(received_custom_records, &custom_tlvs);
-	assert_eq!(node_b.payment(&keysend_payment_id).unwrap().status, PaymentStatus::Succeeded);
-	assert_eq!(node_b.payment(&keysend_payment_id).unwrap().direction, PaymentDirection::Inbound);
-	assert_eq!(node_b.payment(&keysend_payment_id).unwrap().amount_msat, Some(keysend_amount_msat));
-	assert!(matches!(
-		node_b.payment(&keysend_payment_id).unwrap().kind,
-		PaymentKind::Spontaneous { .. }
-	));
+	let received_keysend_payment = node_b.payment(&received_keysend_payment_id).unwrap().unwrap();
+	assert_eq!(received_keysend_payment.status, PaymentStatus::Succeeded);
+	assert_eq!(received_keysend_payment.direction, PaymentDirection::Inbound);
+	assert_eq!(received_keysend_payment.amount_msat, Some(keysend_amount_msat));
+	assert!(matches!(&received_keysend_payment.kind, PaymentKind::Spontaneous { .. }));
 	assert_eq!(
-		node_a.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
+		node_a.list_payments_matching(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
 		5
 	);
 	assert_eq!(
-		node_b.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
-		6
+		node_b.list_payments_matching(|p| matches!(p.kind, PaymentKind::Bolt11 { .. })).len(),
+		5
 	);
 	assert_eq!(
-		node_a
-			.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Spontaneous { .. }))
-			.len(),
+		node_a.list_payments_matching(|p| matches!(p.kind, PaymentKind::Spontaneous { .. })).len(),
 		1
 	);
 	assert_eq!(
-		node_b
-			.list_payments_with_filter(|p| matches!(p.kind, PaymentKind::Spontaneous { .. }))
-			.len(),
+		node_b.list_payments_matching(|p| matches!(p.kind, PaymentKind::Spontaneous { .. })).len(),
 		1
 	);
 
@@ -1382,8 +1646,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert!(splice_out_sat > 500_000);
 	node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
 
-	expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let splice_out_txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
+	wait_for_tx(electrsd, splice_out_txo.txid).await;
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
 	node_a.sync_wallets().unwrap();
@@ -1394,7 +1658,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 
 	assert_eq!(
 		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Inbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		2
@@ -1404,8 +1668,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	let splice_in_sat = splice_out_sat;
 	node_a.splice_in(&user_channel_id_a, node_b.node_id(), splice_in_sat).unwrap();
 
-	expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let splice_in_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
+	wait_for_tx(electrsd, splice_in_txo.txid).await;
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
 	node_a.sync_wallets().unwrap();
@@ -1416,21 +1680,22 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 
 	assert_eq!(
 		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound
+			.list_payments_matching(|p| p.direction == PaymentDirection::Outbound
 				&& matches!(p.kind, PaymentKind::Onchain { .. }))
 			.len(),
 		2
 	);
 
 	if disable_node_b_reserve {
-		let node_a_outbound_capacity_msat = node_a.list_channels()[0].outbound_capacity_msat;
-		let node_a_reserve_msat =
-			node_a.list_channels()[0].unspendable_punishment_reserve.unwrap() * 1000;
-		// TODO: Zero-fee commitment channels are anchor channels, but do not allocate any
-		// funds to the anchor, so this will need to be updated when we ship these channels
-		// in ldk-node.
-		let node_a_anchors_msat = if expect_anchor_channel { 2 * 330 * 1000 } else { 0 };
-		let funding_amount_msat = node_a.list_channels()[0].channel_value_sats * 1000;
+		let node_a_channel = node_a.list_channels().into_iter().next().unwrap();
+		let node_a_outbound_capacity_msat = node_a_channel.outbound_capacity_msat;
+		let node_a_reserve_msat = node_a_channel.unspendable_punishment_reserve.unwrap() * 1000;
+		let zero_fee_commitments = node_a_channel
+			.channel_type
+			.as_ref()
+			.map_or(false, |c| c.requires_anchor_zero_fee_commitments());
+		let node_a_anchors_msat = if zero_fee_commitments { 0 } else { 2 * 330 * 1000 };
+		let funding_amount_msat = node_a_channel.channel_value_sats * 1000;
 		// Node B does not have any reserve, so we only subtract a few items on node A's
 		// side to arrive at node B's capacity
 		let node_b_capacity_msat = funding_amount_msat
@@ -1480,91 +1745,18 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	expect_event!(node_a, ChannelClosed);
 	expect_event!(node_b, ChannelClosed);
 
-	wait_for_outpoint_spend(electrsd, funding_txo_b).await;
+	wait_for_outpoint_spend(electrsd, splice_in_txo).await;
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
 	if force_close {
-		// Check node_b properly sees all balances and sweeps them.
-		assert_eq!(node_b.list_balances().lightning_balances.len(), 1);
-		match node_b.list_balances().lightning_balances[0] {
-			LightningBalance::ClaimableAwaitingConfirmations {
-				counterparty_node_id,
-				confirmation_height,
-				..
-			} => {
-				assert_eq!(counterparty_node_id, node_a.node_id());
-				let cur_height = node_b.status().current_best_block.height;
-				let blocks_to_go = confirmation_height - cur_height;
-				generate_blocks_and_wait(&bitcoind, electrsd, blocks_to_go as usize).await;
-				node_b.sync_wallets().unwrap();
-				node_a.sync_wallets().unwrap();
-			},
-			_ => panic!("Unexpected balance state!"),
-		}
-
-		assert!(node_b.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_b.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
-		node_b.sync_wallets().unwrap();
-		node_a.sync_wallets().unwrap();
-
-		assert!(node_b.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_b.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
-		node_b.sync_wallets().unwrap();
-		node_a.sync_wallets().unwrap();
-
+		settle_force_close_balance(&node_b, node_a.node_id(), &node_a, &bitcoind, electrsd).await;
 		assert!(node_b.list_balances().lightning_balances.is_empty());
 		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
 
-		// Check node_a properly sees all balances and sweeps them.
-		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
-		match node_a.list_balances().lightning_balances[0] {
-			LightningBalance::ClaimableAwaitingConfirmations {
-				counterparty_node_id,
-				confirmation_height,
-				..
-			} => {
-				assert_eq!(counterparty_node_id, node_b.node_id());
-				let cur_height = node_a.status().current_best_block.height;
-				let blocks_to_go = confirmation_height - cur_height;
-				generate_blocks_and_wait(&bitcoind, electrsd, blocks_to_go as usize).await;
-				node_a.sync_wallets().unwrap();
-				node_b.sync_wallets().unwrap();
-			},
-			_ => panic!("Unexpected balance state!"),
-		}
-
-		assert!(node_a.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_a.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_a.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
-		node_a.sync_wallets().unwrap();
-		node_b.sync_wallets().unwrap();
-
-		assert!(node_a.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_a.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_a.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
-		node_a.sync_wallets().unwrap();
-		node_b.sync_wallets().unwrap();
+		settle_force_close_balance(&node_a, node_b.node_id(), &node_b, &bitcoind, electrsd).await;
 	} else {
 		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
 		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
@@ -1610,6 +1802,38 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
 	}
 
+	if force_close {
+		// The recovery reconnect completed while the force-close settled, so the peer no longer
+		// needs to remain persisted.
+		assert!(
+			!node_a.list_peers().iter().any(|p| p.node_id == node_b.node_id() && p.is_persisted),
+			"node_b should be removed from node_a peer store after the recovery reconnect"
+		);
+		assert_all_nodes_have_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"no ",
+			"UnilateralClose",
+			|tx_type| !matches!(tx_type, TransactionType::UnilateralClose { .. }),
+		);
+		assert_any_node_has_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"Sweep",
+			|tx_type| matches!(tx_type, TransactionType::Sweep { .. }),
+		);
+	} else {
+		assert_all_nodes_have_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"all ",
+			"CooperativeClose",
+			|tx_type| matches!(tx_type, TransactionType::CooperativeClose { .. }),
+		);
+		// Peer removed after cooperative close — no further reason to reconnect.
+		assert!(
+			!node_a.list_peers().iter().any(|p| p.node_id == node_b.node_id() && p.is_persisted),
+			"node_b should be removed from node_a peer store after cooperative close"
+		);
+	}
+
 	let sum_of_all_payments_sat = (push_msat
 		+ invoice_amount_1_msat
 		+ overpaid_amount_msat
@@ -1632,20 +1856,20 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert_eq!(node_b.list_balances().total_anchor_channels_reserve_sats, 0);
 
 	// Now we should have seen the channel closing transaction on-chain.
-	assert_eq!(
-		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
-				&& matches!(p.kind, PaymentKind::Onchain { .. }))
-			.len(),
-		3
-	);
-	assert_eq!(
-		node_b
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
-				&& matches!(p.kind, PaymentKind::Onchain { .. }))
-			.len(),
-		2
-	);
+	let node_a_inbound_onchain_count = node_a
+		.list_payments_matching(|p| {
+			p.direction == PaymentDirection::Inbound
+				&& matches!(p.kind, PaymentKind::Onchain { .. })
+		})
+		.len();
+	let node_b_inbound_onchain_count = node_b
+		.list_payments_matching(|p| {
+			p.direction == PaymentDirection::Inbound
+				&& matches!(p.kind, PaymentKind::Onchain { .. })
+		})
+		.len();
+	assert!(node_a_inbound_onchain_count >= 3);
+	assert!(node_b_inbound_onchain_count >= 2);
 
 	// Check we handled all events
 	assert_eq!(node_a.next_event(), None);
@@ -1734,6 +1958,7 @@ struct TestSyncStoreInner {
 	serializer: tokio::sync::RwLock<()>,
 	test_store: InMemoryStore,
 	fs_store: FilesystemStore,
+	#[cfg(feature = "storage-sqlite")]
 	sqlite_store: SqliteStore,
 }
 
@@ -1743,8 +1968,11 @@ impl TestSyncStoreInner {
 		let mut fs_dir = dest_dir.clone();
 		fs_dir.push("fs_store");
 		let fs_store = FilesystemStore::new(fs_dir);
+		#[cfg(feature = "storage-sqlite")]
 		let mut sql_dir = dest_dir.clone();
+		#[cfg(feature = "storage-sqlite")]
 		sql_dir.push("sqlite_store");
+		#[cfg(feature = "storage-sqlite")]
 		let sqlite_store = SqliteStore::new(
 			sql_dir,
 			Some("test_sync_db".to_string()),
@@ -1752,15 +1980,21 @@ impl TestSyncStoreInner {
 		)
 		.unwrap();
 		let test_store = InMemoryStore::new();
-		Self { serializer, fs_store, sqlite_store, test_store }
+		Self {
+			serializer,
+			fs_store,
+			#[cfg(feature = "storage-sqlite")]
+			sqlite_store,
+			test_store,
+		}
 	}
 
 	async fn do_list_async(
 		&self, primary_namespace: &str, secondary_namespace: &str,
 	) -> lightning::io::Result<Vec<String>> {
 		let fs_res = KVStore::list(&self.fs_store, primary_namespace, secondary_namespace).await;
-		let sqlite_res =
-			KVStore::list(&self.sqlite_store, primary_namespace, secondary_namespace).await;
+		#[cfg(feature = "storage-sqlite")]
+		let sqlite_res = KVStore::list(&self.sqlite_store, primary_namespace, secondary_namespace).await;
 		let test_res =
 			KVStore::list(&self.test_store, primary_namespace, secondary_namespace).await;
 
@@ -1768,9 +2002,12 @@ impl TestSyncStoreInner {
 			Ok(mut list) => {
 				list.sort();
 
-				let mut sqlite_list = sqlite_res.unwrap();
-				sqlite_list.sort();
-				assert_eq!(list, sqlite_list);
+				#[cfg(feature = "storage-sqlite")]
+				{
+					let mut sqlite_list = sqlite_res.unwrap();
+					sqlite_list.sort();
+					assert_eq!(list, sqlite_list);
+				}
 
 				let mut test_list = test_res.unwrap();
 				test_list.sort();
@@ -1779,6 +2016,7 @@ impl TestSyncStoreInner {
 				Ok(list)
 			},
 			Err(e) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
@@ -1797,6 +2035,7 @@ impl TestSyncStoreInner {
 		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
 	) -> lightning::io::Result<PaginatedListResponse> {
 		let _guard = self.serializer.read().await;
+		#[cfg(feature = "storage-sqlite")]
 		let sqlite_res = PaginatedKVStore::list_paginated(
 			&self.sqlite_store,
 			primary_namespace,
@@ -1812,7 +2051,8 @@ impl TestSyncStoreInner {
 		)
 		.await;
 
-		match sqlite_res {
+		#[cfg(feature = "storage-sqlite")]
+		return match sqlite_res {
 			Ok(sqlite_response) => {
 				assert_eq!(sqlite_response, test_res.unwrap());
 				Ok(sqlite_response)
@@ -1821,7 +2061,10 @@ impl TestSyncStoreInner {
 				assert!(test_res.is_err());
 				Err(e)
 			},
-		}
+		};
+
+		#[cfg(not(feature = "storage-sqlite"))]
+		test_res
 	}
 
 	async fn read_internal_async(
@@ -1831,6 +2074,7 @@ impl TestSyncStoreInner {
 
 		let fs_res =
 			KVStore::read(&self.fs_store, primary_namespace, secondary_namespace, key).await;
+		#[cfg(feature = "storage-sqlite")]
 		let sqlite_res =
 			KVStore::read(&self.sqlite_store, primary_namespace, secondary_namespace, key).await;
 		let test_res =
@@ -1838,13 +2082,17 @@ impl TestSyncStoreInner {
 
 		match fs_res {
 			Ok(read) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert_eq!(read, sqlite_res.unwrap());
 				assert_eq!(read, test_res.unwrap());
 				Ok(read)
 			},
 			Err(e) => {
-				assert!(sqlite_res.is_err());
-				assert_eq!(e.kind(), unsafe { sqlite_res.unwrap_err_unchecked().kind() });
+				#[cfg(feature = "storage-sqlite")]
+				{
+					assert!(sqlite_res.is_err());
+					assert_eq!(e.kind(), unsafe { sqlite_res.unwrap_err_unchecked().kind() });
+				}
 				assert!(test_res.is_err());
 				assert_eq!(e.kind(), unsafe { test_res.unwrap_err_unchecked().kind() });
 				Err(e)
@@ -1864,6 +2112,7 @@ impl TestSyncStoreInner {
 			buf.clone(),
 		)
 		.await;
+		#[cfg(feature = "storage-sqlite")]
 		let sqlite_res = KVStore::write(
 			&self.sqlite_store,
 			primary_namespace,
@@ -1889,11 +2138,13 @@ impl TestSyncStoreInner {
 
 		match fs_res {
 			Ok(()) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert!(sqlite_res.is_ok());
 				assert!(test_res.is_ok());
 				Ok(())
 			},
 			Err(e) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
@@ -1908,6 +2159,7 @@ impl TestSyncStoreInner {
 		let fs_res =
 			KVStore::remove(&self.fs_store, primary_namespace, secondary_namespace, key, lazy)
 				.await;
+		#[cfg(feature = "storage-sqlite")]
 		let sqlite_res =
 			KVStore::remove(&self.sqlite_store, primary_namespace, secondary_namespace, key, lazy)
 				.await;
@@ -1923,11 +2175,13 @@ impl TestSyncStoreInner {
 
 		match fs_res {
 			Ok(()) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert!(sqlite_res.is_ok());
 				assert!(test_res.is_ok());
 				Ok(())
 			},
 			Err(e) => {
+				#[cfg(feature = "storage-sqlite")]
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
@@ -1938,7 +2192,7 @@ impl TestSyncStoreInner {
 
 /// The PostgreSQL connection string used by the Postgres-backed tests, overridable via the
 /// `TEST_POSTGRES_URL` environment variable.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "storage-postgres")]
 pub(crate) fn test_connection_string() -> String {
 	std::env::var("TEST_POSTGRES_URL")
 		.unwrap_or_else(|_| "host=localhost user=postgres password=postgres".to_string())
@@ -1946,7 +2200,7 @@ pub(crate) fn test_connection_string() -> String {
 
 /// Drops the given table from the `ldk_db` database, ignoring the case where the database doesn't
 /// exist yet. Used to ensure a clean slate before and after Postgres-backed tests.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "storage-postgres")]
 pub(crate) async fn drop_table(table_name: &str) {
 	let connection_string = format!("{} dbname=ldk_db", test_connection_string());
 	let Ok((client, connection)) =

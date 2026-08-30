@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use bitcoin::transaction::Version;
 use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Transaction, Txid};
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::chain::{BlockLocator, Listen};
@@ -30,7 +31,7 @@ use lightning_block_sync::{
 };
 use serde::Serialize;
 
-use super::WalletSyncStatus;
+use super::{WalletSyncGuard, WalletSyncStatus};
 use crate::config::{
 	BitcoindRestClientConfig, Config, DEFAULT_FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS,
 	DEFAULT_TX_BROADCAST_TIMEOUT_SECS,
@@ -41,14 +42,44 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, PersistedNodeMetrics};
 
 const CHAIN_POLLING_INTERVAL_SECS: u64 = 2;
 const CHAIN_POLLING_TIMEOUT_SECS: u64 = 10;
 
+type BitcoindSpvClient =
+	SpvClient<ChainPoller<Arc<BitcoindClient>, BitcoindClient>, Arc<ChainListener>>;
+
+async fn acquire_initial_wallet_sync_guard<'a>(
+	wallet_polling_status: &'a Mutex<WalletSyncStatus>,
+	stop_sync_receiver: &mut tokio::sync::watch::Receiver<()>,
+) -> Option<WalletSyncGuard<'a>> {
+	loop {
+		let mut pending_sync = {
+			let mut status_lock = wallet_polling_status.lock().expect("lock");
+			match status_lock.register_or_subscribe_pending_sync() {
+				Some(pending_sync) => pending_sync,
+				None => {
+					return Some(WalletSyncGuard::new(
+						wallet_polling_status,
+						Error::WalletOperationFailed,
+					));
+				},
+			}
+		};
+		tokio::select! {
+			biased;
+			_ = stop_sync_receiver.changed() => return None,
+			_ = pending_sync.recv() => {},
+		}
+	}
+}
+
 pub(super) struct BitcoindChainSource {
 	api_client: Arc<BitcoindClient>,
+	spv_client: tokio::sync::Mutex<Option<BitcoindSpvClient>>,
 	latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
 	wallet_polling_status: Mutex<WalletSyncStatus>,
 	fee_estimator: Arc<OnchainFeeEstimator>,
@@ -72,9 +103,11 @@ impl BitcoindChainSource {
 		));
 
 		let latest_chain_tip = RwLock::new(None);
+		let spv_client = tokio::sync::Mutex::new(None);
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 		Self {
 			api_client,
+			spv_client,
 			latest_chain_tip,
 			wallet_polling_status,
 			fee_estimator,
@@ -101,10 +134,12 @@ impl BitcoindChainSource {
 		));
 
 		let latest_chain_tip = RwLock::new(None);
+		let spv_client = tokio::sync::Mutex::new(None);
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 
 		Self {
 			api_client,
+			spv_client,
 			latest_chain_tip,
 			wallet_polling_status,
 			fee_estimator,
@@ -119,6 +154,30 @@ impl BitcoindChainSource {
 		self.api_client.utxo_source()
 	}
 
+	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		let node_version_result = tokio::time::timeout(
+			Duration::from_secs(CHAIN_POLLING_TIMEOUT_SECS),
+			self.api_client.get_node_version(),
+		)
+		.await
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to get node version: {:?}", e);
+			Error::ConnectionFailed
+		})?;
+
+		let node_version = node_version_result.map_err(|e| {
+			log_error!(self.logger, "Failed to get node version: {:?}", e);
+			Error::ConnectionFailed
+		})?;
+
+		// v26 first shipped the `submitpackage` RPC, but we need v29 to relay ephemeral dust
+		if node_version < 290000 {
+			log_error!(self.logger, "Bitcoin backend MUST be greater than or equal to v29");
+			return Err(Error::ChainSourceNotSupported);
+		}
+		Ok(())
+	}
+
 	pub(super) async fn continuously_sync_wallets(
 		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
@@ -126,12 +185,13 @@ impl BitcoindChainSource {
 	) {
 		// First register for the wallet polling status to make sure `Node::sync_wallets` calls
 		// wait on the result before proceeding.
-		{
-			let mut status_lock = self.wallet_polling_status.lock().expect("lock");
-			if status_lock.register_or_subscribe_pending_sync().is_some() {
-				debug_assert!(false, "Sync already in progress. This should never happen.");
-			}
-		}
+		let Some(initial_sync_guard) =
+			acquire_initial_wallet_sync_guard(&self.wallet_polling_status, &mut stop_sync_receiver)
+				.await
+		else {
+			log_trace!(self.logger, "Stopping initial chain sync.");
+			return;
+		};
 
 		log_info!(
 			self.logger,
@@ -184,7 +244,16 @@ impl BitcoindChainSource {
 			)
 			.await
 			{
-				Ok((_header_cache, chain_tip)) => {
+				Ok((header_cache, chain_tip)) => {
+					let spv_client = self.new_spv_client(
+						chain_tip,
+						header_cache,
+						Arc::clone(&onchain_wallet),
+						Arc::clone(&channel_manager),
+						Arc::clone(&chain_monitor),
+						Arc::clone(&output_sweeper),
+					);
+					*self.spv_client.lock().await = Some(spv_client);
 					{
 						let elapsed_ms = now.elapsed().map(|d| d.as_millis()).unwrap_or(0);
 						log_info!(
@@ -259,7 +328,7 @@ impl BitcoindChainSource {
 		}
 
 		// Now propagate the initial result to unblock waiting subscribers.
-		self.wallet_polling_status.lock().expect("lock").propagate_result_to_subscribers(Ok(()));
+		initial_sync_guard.complete(Ok(()));
 
 		let mut chain_polling_interval =
 			tokio::time::interval(Duration::from_secs(CHAIN_POLLING_INTERVAL_SECS));
@@ -370,6 +439,8 @@ impl BitcoindChainSource {
 				Error::WalletOperationFailed
 			})?;
 		}
+		let sync_guard =
+			WalletSyncGuard::new(&self.wallet_polling_status, Error::WalletOperationFailed);
 
 		let res = self
 			.poll_and_update_listeners_inner(
@@ -380,7 +451,7 @@ impl BitcoindChainSource {
 			)
 			.await;
 
-		self.wallet_polling_status.lock().expect("lock").propagate_result_to_subscribers(res);
+		sync_guard.complete(res);
 
 		res
 	}
@@ -389,19 +460,24 @@ impl BitcoindChainSource {
 		&self, onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
 		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
-		let latest_chain_tip_opt = self.latest_chain_tip.read().expect("lock").clone();
-		let chain_tip =
-			if let Some(tip) = latest_chain_tip_opt { tip } else { self.poll_chain_tip().await? };
-
-		let chain_poller = ChainPoller::new(Arc::clone(&self.api_client), self.config.network);
-		let chain_listener = ChainListener {
-			onchain_wallet: Arc::clone(&onchain_wallet),
-			channel_manager: Arc::clone(&channel_manager),
-			chain_monitor: Arc::clone(&chain_monitor),
-			output_sweeper,
-		};
-		let mut spv_client =
-			SpvClient::new(chain_tip, chain_poller, HeaderCache::new(), &chain_listener);
+		let mut spv_client_lock = self.spv_client.lock().await;
+		if spv_client_lock.is_none() {
+			let latest_chain_tip_opt = self.latest_chain_tip.read().expect("lock").clone();
+			let chain_tip = if let Some(tip) = latest_chain_tip_opt {
+				tip
+			} else {
+				self.poll_chain_tip().await?
+			};
+			*spv_client_lock = Some(self.new_spv_client(
+				chain_tip,
+				HeaderCache::new(),
+				Arc::clone(&onchain_wallet),
+				Arc::clone(&channel_manager),
+				chain_monitor,
+				output_sweeper,
+			));
+		}
+		let spv_client = spv_client_lock.as_mut().expect("initialized above");
 
 		let now = SystemTime::now();
 		match spv_client.poll_best_tip().await {
@@ -416,6 +492,7 @@ impl BitcoindChainSource {
 				return Err(Error::TxSyncFailed);
 			},
 		}
+		drop(spv_client_lock);
 
 		let cur_height = channel_manager.current_best_block().height;
 
@@ -435,11 +512,12 @@ impl BitcoindChainSource {
 					evicted_txids.len(),
 					elapsed_ms,
 				);
-				onchain_wallet.apply_mempool_txs(unconfirmed_txs, evicted_txids).unwrap_or_else(
-					|e| {
+				onchain_wallet
+					.apply_mempool_txs(unconfirmed_txs, evicted_txids)
+					.await
+					.unwrap_or_else(|e| {
 						log_error!(self.logger, "Failed to apply mempool transactions: {:?}", e);
-					},
-				);
+					});
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to poll for mempool transactions: {:?}", e);
@@ -456,6 +534,21 @@ impl BitcoindChainSource {
 		.await?;
 
 		Ok(())
+	}
+
+	fn new_spv_client(
+		&self, chain_tip: ValidatedBlockHeader, header_cache: HeaderCache,
+		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+	) -> BitcoindSpvClient {
+		let chain_poller = ChainPoller::new(Arc::clone(&self.api_client), self.config.network);
+		let chain_listener = Arc::new(ChainListener {
+			onchain_wallet: Arc::downgrade(&onchain_wallet),
+			channel_manager: Arc::downgrade(&channel_manager),
+			chain_monitor: Arc::downgrade(&chain_monitor),
+			output_sweeper: Arc::downgrade(&output_sweeper),
+		});
+		SpvClient::new(chain_tip, chain_poller, header_cache, chain_listener)
 	}
 
 	pub(super) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
@@ -571,46 +664,59 @@ impl BitcoindChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
-		// features, we should eventually switch to use `submitpackage` via the
-		// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
-		// transactions.
-		for tx in &package {
-			let txid = tx.compute_txid();
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
-				self.api_client.broadcast_transaction(tx),
-			);
-			match timeout_fut.await {
-				Ok(res) => match res {
-					Ok(id) => {
-						debug_assert_eq!(id, txid);
-						log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+	fn log_broadcast_error(
+		&self, e: impl core::fmt::Display, txids: &[Txid], txs: &SortedTransactions,
+	) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs.iter() {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => {
+				let txids: Vec<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+				let timeout_fut = tokio::time::timeout(
+					Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
+					self.api_client.submit_package(&txs),
+				);
+				match timeout_fut.await {
+					Ok(res) => match res {
+						Ok(result) => {
+							log_trace!(self.logger, "Successfully broadcast package {:?}", txids);
+							log_trace!(self.logger, "Successfully broadcast package {}", result);
+						},
+						Err(e) => self.log_broadcast_error(e, &txids, &txs),
 					},
-					Err(e) => {
-						log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
-						log_trace!(
-							self.logger,
-							"Failed broadcast transaction bytes: {}",
-							log_bytes!(tx.encode())
-						);
-					},
-				},
-				Err(e) => {
-					log_error!(
-						self.logger,
-						"Failed to broadcast transaction due to timeout {}: {}",
-						txid,
-						e
+					Err(e) => self.log_broadcast_error(e, &txids, &txs),
+				}
+			},
+			_ => {
+				for tx in txs.iter() {
+					let txid = tx.compute_txid();
+					let timeout_fut = tokio::time::timeout(
+						Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
+						self.api_client.broadcast_transaction(tx),
 					);
-					log_trace!(
-						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx.encode())
-					);
-				},
-			}
+					match timeout_fut.await {
+						Ok(res) => match res {
+							Ok(id) => {
+								debug_assert_eq!(id, txid);
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transaction {}",
+									txid
+								);
+							},
+							Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+						},
+						Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+					}
+				}
+			},
 		}
 	}
 }
@@ -748,6 +854,31 @@ impl BitcoindClient {
 		}
 	}
 
+	pub(crate) async fn get_node_version(&self) -> Result<u64, BitcoindClientError> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::get_node_version_inner(Arc::clone(rpc_client))
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+			BitcoindClient::Rest { rpc_client, .. } => {
+				// Bitcoin Core's REST interface does not support `getnetworkinfo`
+				// so we use the RPC client.
+				Self::get_node_version_inner(Arc::clone(rpc_client))
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+		}
+	}
+
+	async fn get_node_version_inner(rpc_client: Arc<RpcClient>) -> Result<u64, RpcClientError> {
+		rpc_client.call_method::<serde_json::Value>("getnetworkinfo", &[]).await.and_then(|value| {
+			value["version"].as_u64().ok_or(RpcClientError::InvalidData(String::from(
+				"The version field in the `getnetworkinfo` response should be a u64",
+			)))
+		})
+	}
+
 	/// Broadcasts the provided transaction.
 	pub(crate) async fn broadcast_transaction(
 		&self, tx: &Transaction,
@@ -774,6 +905,38 @@ impl BitcoindClient {
 		let tx_serialized = bitcoin::consensus::encode::serialize_hex(tx);
 		let tx_json = serde_json::json!(tx_serialized);
 		rpc_client.call_method::<Txid>("sendrawtransaction", &[tx_json]).await
+	}
+
+	/// Submits the provided package
+	pub(crate) async fn submit_package(
+		&self, package: &SortedTransactions,
+	) -> Result<String, BitcoindClientError> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::submit_package_inner(Arc::clone(rpc_client), package)
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+			BitcoindClient::Rest { rpc_client, .. } => {
+				// Bitcoin Core's REST interface does not support submitting packages
+				// so we use the RPC client.
+				Self::submit_package_inner(Arc::clone(rpc_client), package)
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+		}
+	}
+
+	async fn submit_package_inner(
+		rpc_client: Arc<RpcClient>, package: &SortedTransactions,
+	) -> Result<String, RpcClientError> {
+		let package_serialized: Vec<_> =
+			package.iter().map(|tx| bitcoin::consensus::encode::serialize_hex(tx)).collect();
+		let package_json = serde_json::json!(package_serialized);
+		rpc_client
+			.call_method::<SubmitPackageResponse>("submitpackage", &[package_json])
+			.await
+			.map(|response| response.0)
 	}
 
 	/// Retrieve the fee estimate needed for a transaction to begin
@@ -909,7 +1072,7 @@ impl BitcoindClient {
 	}
 
 	/// Retrieves the raw mempool.
-	pub(crate) async fn get_raw_mempool(&self) -> Result<Vec<Txid>, BitcoindClientError> {
+	pub(crate) async fn get_raw_mempool(&self) -> Result<HashSet<Txid>, BitcoindClientError> {
 		match self {
 			BitcoindClient::Rpc { rpc_client, .. } => {
 				Self::get_raw_mempool_rpc(Arc::clone(rpc_client))
@@ -925,7 +1088,9 @@ impl BitcoindClient {
 	}
 
 	/// Retrieves the raw mempool via the RPC interface.
-	async fn get_raw_mempool_rpc(rpc_client: Arc<RpcClient>) -> Result<Vec<Txid>, RpcClientError> {
+	async fn get_raw_mempool_rpc(
+		rpc_client: Arc<RpcClient>,
+	) -> Result<HashSet<Txid>, RpcClientError> {
 		let verbose_flag_json = serde_json::json!(false);
 		rpc_client
 			.call_method::<GetRawMempoolResponse>("getrawmempool", &[verbose_flag_json])
@@ -936,7 +1101,7 @@ impl BitcoindClient {
 	/// Retrieves the raw mempool via the REST interface.
 	async fn get_raw_mempool_rest(
 		rest_client: Arc<RestClient>,
-	) -> Result<Vec<Txid>, HttpClientError> {
+	) -> Result<HashSet<Txid>, HttpClientError> {
 		rest_client
 			.request_resource::<JsonResponse, GetRawMempoolResponse>(
 				"mempool/contents.json?verbose=false",
@@ -1183,8 +1348,13 @@ impl BlockSource for BitcoindClient {
 				BitcoindClient::Rpc { rpc_client, .. } => {
 					rpc_client.get_header(header_hash, height_hint).await
 				},
-				BitcoindClient::Rest { rest_client, .. } => {
-					rest_client.get_header(header_hash, height_hint).await
+				BitcoindClient::Rest { rest_client, rpc_client, .. } => {
+					match rest_client.get_header(header_hash, height_hint).await {
+						Err(e) if e.kind() == BlockSourceErrorKind::Persistent => {
+							rpc_client.get_header(header_hash, height_hint).await
+						},
+						result => result,
+					}
 				},
 			}
 		}
@@ -1257,9 +1427,12 @@ pub(crate) struct GetRawTransactionResponse(pub Transaction);
 impl TryInto<GetRawTransactionResponse> for JsonResponse {
 	type Error = String;
 	fn try_into(self) -> Result<GetRawTransactionResponse, String> {
+		// Accept both the bare hex-encoded TX from RPC, and the REST response
+		// of a JSON object with the hex-encoded TX in the 'hex' field.
 		let tx = self
 			.0
 			.as_str()
+			.or_else(|| self.0.get("hex").and_then(|v| v.as_str()))
 			.ok_or("Failed to parse getrawtransaction response".to_string())
 			.and_then(|s| {
 				bitcoin::consensus::encode::deserialize_hex(s)
@@ -1270,14 +1443,14 @@ impl TryInto<GetRawTransactionResponse> for JsonResponse {
 	}
 }
 
-pub struct GetRawMempoolResponse(Vec<Txid>);
+pub struct GetRawMempoolResponse(HashSet<Txid>);
 
 impl TryInto<GetRawMempoolResponse> for JsonResponse {
 	type Error = String;
 	fn try_into(self) -> Result<GetRawMempoolResponse, String> {
 		let res = self.0.as_array().ok_or("Failed to parse getrawmempool response".to_string())?;
 
-		let mut mempool_transactions = Vec::with_capacity(res.len());
+		let mut mempool_transactions = HashSet::with_capacity(res.len());
 
 		for hex in res {
 			let txid = if let Some(hex_str) = hex.as_str() {
@@ -1291,7 +1464,7 @@ impl TryInto<GetRawMempoolResponse> for JsonResponse {
 				return Err("Failed to parse getrawmempool response".to_string());
 			};
 
-			mempool_transactions.push(txid);
+			mempool_transactions.insert(txid);
 		}
 
 		Ok(GetRawMempoolResponse(mempool_transactions))
@@ -1327,6 +1500,23 @@ impl TryInto<GetMempoolEntryResponse> for JsonResponse {
 	}
 }
 
+pub struct SubmitPackageResponse(String);
+
+impl TryInto<SubmitPackageResponse> for JsonResponse {
+	type Error = String;
+	fn try_into(self) -> Result<SubmitPackageResponse, String> {
+		let response = self.0.to_string();
+		let res = self.0.as_object().ok_or("Failed to parse submitpackage response".to_string())?;
+
+		match res["package_msg"].as_str() {
+			Some("success") => Ok(SubmitPackageResponse(response)),
+			Some(_) | None => {
+				return Err(response);
+			},
+		}
+	}
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MempoolEntry {
 	/// The transaction id
@@ -1345,10 +1535,23 @@ pub(crate) enum FeeRateEstimationMode {
 }
 
 pub(crate) struct ChainListener {
-	pub(crate) onchain_wallet: Arc<Wallet>,
-	pub(crate) channel_manager: Arc<ChannelManager>,
-	pub(crate) chain_monitor: Arc<ChainMonitor>,
-	pub(crate) output_sweeper: Arc<Sweeper>,
+	pub(crate) onchain_wallet: std::sync::Weak<Wallet>,
+	pub(crate) channel_manager: std::sync::Weak<ChannelManager>,
+	pub(crate) chain_monitor: std::sync::Weak<ChainMonitor>,
+	pub(crate) output_sweeper: std::sync::Weak<Sweeper>,
+}
+
+impl ChainListener {
+	fn upgrade(
+		&self,
+	) -> Option<(Arc<Wallet>, Arc<ChannelManager>, Arc<ChainMonitor>, Arc<Sweeper>)> {
+		Some((
+			self.onchain_wallet.upgrade()?,
+			self.channel_manager.upgrade()?,
+			self.chain_monitor.upgrade()?,
+			self.output_sweeper.upgrade()?,
+		))
+	}
 }
 
 impl Listen for ChainListener {
@@ -1356,23 +1559,35 @@ impl Listen for ChainListener {
 		&self, header: &bitcoin::block::Header,
 		txdata: &lightning::chain::transaction::TransactionData, height: u32,
 	) {
-		self.onchain_wallet.filtered_block_connected(header, txdata, height);
-		self.channel_manager.filtered_block_connected(header, txdata, height);
-		self.chain_monitor.filtered_block_connected(header, txdata, height);
-		self.output_sweeper.filtered_block_connected(header, txdata, height);
+		if let Some((onchain_wallet, channel_manager, chain_monitor, output_sweeper)) =
+			self.upgrade()
+		{
+			onchain_wallet.filtered_block_connected(header, txdata, height);
+			channel_manager.filtered_block_connected(header, txdata, height);
+			chain_monitor.filtered_block_connected(header, txdata, height);
+			output_sweeper.filtered_block_connected(header, txdata, height);
+		}
 	}
 	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
-		self.onchain_wallet.block_connected(block, height);
-		self.channel_manager.block_connected(block, height);
-		self.chain_monitor.block_connected(block, height);
-		self.output_sweeper.block_connected(block, height);
+		if let Some((onchain_wallet, channel_manager, chain_monitor, output_sweeper)) =
+			self.upgrade()
+		{
+			onchain_wallet.block_connected(block, height);
+			channel_manager.block_connected(block, height);
+			chain_monitor.block_connected(block, height);
+			output_sweeper.block_connected(block, height);
+		}
 	}
 
 	fn blocks_disconnected(&self, fork_point_block: lightning::chain::BlockLocator) {
-		self.onchain_wallet.blocks_disconnected(fork_point_block);
-		self.channel_manager.blocks_disconnected(fork_point_block);
-		self.chain_monitor.blocks_disconnected(fork_point_block);
-		self.output_sweeper.blocks_disconnected(fork_point_block);
+		if let Some((onchain_wallet, channel_manager, chain_monitor, output_sweeper)) =
+			self.upgrade()
+		{
+			onchain_wallet.blocks_disconnected(fork_point_block);
+			channel_manager.blocks_disconnected(fork_point_block);
+			chain_monitor.blocks_disconnected(fork_point_block);
+			output_sweeper.blocks_disconnected(fork_point_block);
+		}
 	}
 }
 
@@ -1403,6 +1618,10 @@ impl std::error::Error for BitcoindClientError {}
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+	use std::sync::Mutex;
+	use std::time::Duration;
+
 	use bitcoin::hashes::Hash;
 	use bitcoin::{FeeRate, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness};
 	use lightning_block_sync::http::JsonResponse;
@@ -1412,9 +1631,36 @@ mod tests {
 	use serde_json::json;
 
 	use crate::chain::bitcoind::{
-		FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-		MempoolMinFeeResponse,
+		acquire_initial_wallet_sync_guard, FeeResponse, GetMempoolEntryResponse,
+		GetRawMempoolResponse, GetRawTransactionResponse, MempoolMinFeeResponse,
 	};
+	use crate::chain::{WalletSyncGuard, WalletSyncStatus};
+	use crate::Error;
+
+	#[tokio::test]
+	async fn initial_sync_waits_for_in_progress_sync() {
+		let status = Mutex::new(WalletSyncStatus::Completed);
+		assert!(status.lock().expect("lock").register_or_subscribe_pending_sync().is_none());
+		let in_progress_guard = WalletSyncGuard::new(&status, Error::WalletOperationFailed);
+		let (_stop_sender, mut stop_receiver) = tokio::sync::watch::channel(());
+		let mut acquire_guard =
+			Box::pin(acquire_initial_wallet_sync_guard(&status, &mut stop_receiver));
+
+		let early_result =
+			tokio::time::timeout(Duration::from_millis(10), acquire_guard.as_mut()).await;
+		assert!(early_result.is_err(), "background sync should wait for the active sync");
+
+		in_progress_guard.complete(Ok(()));
+		let acquired_guard = tokio::time::timeout(Duration::from_secs(1), acquire_guard)
+			.await
+			.expect("background sync should resume")
+			.expect("background sync should acquire the sync guard");
+		assert!(
+			matches!(*status.lock().expect("lock"), WalletSyncStatus::InProgress { .. }),
+			"background sync should own the next sync"
+		);
+		acquired_guard.complete(Ok(()));
+	}
 
 	prop_compose! {
 		fn arbitrary_witness()(
@@ -1481,10 +1727,10 @@ mod tests {
 
 		#[test]
 		fn prop_get_raw_mempool_response_roundtrip(txids in vec(any::<[u8;32]>(), 0..10)) {
-			let txid_vec: Vec<Txid> = txids.into_iter().map(Txid::from_byte_array).collect();
-			let original = GetRawMempoolResponse(txid_vec.clone());
+			let txid_set: HashSet<Txid> = txids.into_iter().map(Txid::from_byte_array).collect();
+			let original = GetRawMempoolResponse(txid_set.clone());
 
-			let json_vec: Vec<String> = txid_vec.iter().map(|t| t.to_string()).collect();
+			let json_vec: Vec<String> = txid_set.iter().map(|t| t.to_string()).collect();
 			let json_val = serde_json::Value::Array(json_vec.iter().map(|s| json!(s)).collect());
 
 			let resp = JsonResponse(json_val);
@@ -1525,6 +1771,26 @@ mod tests {
 
 			prop_assert_eq!(decoded.0, tx);
 		}
+
+		#[test]
+		fn prop_get_raw_transaction_response_json_object_roundtrip(tx in arbitrary_transaction()) {
+			let hex = bitcoin::consensus::encode::serialize_hex(&tx);
+			let vsize = tx.vsize();
+			let json_val = json!({
+				"version": tx.version,
+				"vsize": vsize,
+				"hex": hex,
+			});
+
+			let resp = JsonResponse(json_val);
+			let decoded: GetRawTransactionResponse = resp.try_into().unwrap();
+
+			prop_assert_eq!(decoded.0.compute_txid(), tx.compute_txid());
+			prop_assert_eq!(decoded.0.compute_wtxid(), tx.compute_wtxid());
+
+			prop_assert_eq!(decoded.0, tx);
+		}
+
 
 		#[test]
 		fn prop_fee_response_roundtrip(fee_rate in any::<f64>()) {

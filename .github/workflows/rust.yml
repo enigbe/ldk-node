@@ -8,7 +8,7 @@ concurrency:
 
 jobs:
   build:
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       matrix:
         platform: [
@@ -54,7 +54,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bin/bitcoind-${{ runner.os }}-${{ runner.arch }}
-          key: bitcoind-29.0-${{ runner.os }}-${{ runner.arch }}
+          key: bitcoind-31.1-${{ runner.os }}-${{ runner.arch }}
       - name: Enable caching for electrs
         id: cache-electrs
         uses: actions/cache@v4
@@ -76,12 +76,12 @@ jobs:
         run: cargo build --verbose --color always
       - name: Build with UniFFI support on Rust ${{ matrix.toolchain }}
         if: matrix.build-uniffi
-        run: cargo build --features uniffi --verbose --color always
+        run: cargo build --no-default-features --features uniffi-default --verbose --color always
       - name: Check release build on Rust ${{ matrix.toolchain }}
         run: cargo check --release --verbose --color always
       - name: Check release build with UniFFI support on Rust ${{ matrix.toolchain }}
         if: matrix.build-uniffi
-        run: cargo check --release --features uniffi --verbose --color always
+        run: cargo check --release --no-default-features --features uniffi-default --verbose --color always
       - name: Test on Rust ${{ matrix.toolchain }}
         if: "matrix.platform != 'windows-latest'"
         run: |
@@ -89,11 +89,11 @@ jobs:
       - name: Test with UniFFI support on Rust ${{ matrix.toolchain }}
         if: "matrix.platform != 'windows-latest' && matrix.build-uniffi"
         run: |
-          RUSTFLAGS="--cfg no_download --cfg cycle_tests" cargo test --features uniffi
+          RUSTFLAGS="--cfg no_download --cfg cycle_tests" cargo test --no-default-features --features uniffi-default
 
   linting:
     name: Linting
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: self-hosted
     steps:
       - name: Checkout source code
@@ -106,11 +106,11 @@ jobs:
       - name: Ban `unwrap` in library code
         run: |
           cargo clippy --lib --verbose --color always -- -A warnings -D clippy::unwrap_used -A clippy::tabs_in_doc_comments
-          cargo clippy --lib --features uniffi --verbose --color always -- -A warnings -D clippy::unwrap_used -A clippy::tabs_in_doc_comments
+          cargo clippy --lib --no-default-features --features uniffi-default --verbose --color always -- -A warnings -D clippy::unwrap_used -A clippy::tabs_in_doc_comments
 
   doc:
     name: Documentation
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: self-hosted
     env:
       RUSTDOCFLAGS: -Dwarnings

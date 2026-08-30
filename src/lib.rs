@@ -27,9 +27,10 @@
 //! # {
 //! use std::str::FromStr;
 //!
+//! use ldk_node::bip39::Mnemonic;
 //! use ldk_node::bitcoin::secp256k1::PublicKey;
 //! use ldk_node::bitcoin::Network;
-//! use ldk_node::entropy::{generate_entropy_mnemonic, NodeEntropy};
+//! use ldk_node::entropy::NodeEntropy;
 //! use ldk_node::lightning::ln::msgs::SocketAddress;
 //! use ldk_node::lightning_invoice::Bolt11Invoice;
 //! use ldk_node::Builder;
@@ -42,7 +43,7 @@
 //! 		"https://rapidsync.lightningdevkit.org/testnet/v2/snapshot".to_string(),
 //! 	);
 //!
-//! 	let mnemonic = generate_entropy_mnemonic(None);
+//! 	let mnemonic = Mnemonic::generate(24).unwrap();
 //! 	let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
 //! 	let node = builder.build(node_entropy).unwrap();
 //!
@@ -80,6 +81,13 @@
 #![allow(ellipsis_inclusive_range_patterns)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(not(any(
+	feature = "chain-esplora",
+	feature = "chain-electrum",
+	feature = "chain-bitcoind"
+)))]
+compile_error!("at least one chain source feature must be enabled");
+
 mod balance;
 mod builder;
 mod chain;
@@ -101,10 +109,12 @@ pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
+pub mod probing;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;
 mod types;
+mod util;
 mod wallet;
 
 use std::default::Default;
@@ -120,11 +130,7 @@ use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "uniffi")]
 pub use bitcoin::FeeRate;
 use bitcoin::{Address, Amount, BlockHash, Network};
-#[cfg(feature = "uniffi")]
-pub use builder::ArcedNodeBuilder as Builder;
-pub use builder::BuildError;
-#[cfg(not(feature = "uniffi"))]
-pub use builder::NodeBuilder as Builder;
+pub use builder::{BuildError, Builder};
 use chain::ChainSource;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
@@ -161,30 +167,38 @@ use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use lightning_types::features::NodeFeatures as LdkNodeFeatures;
+use lightning_types::features::{
+	ChannelTypeFeatures, InitFeatures, NodeFeatures as LdkNodeFeatures,
+};
 use liquidity::LiquiditySource;
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use payment::{
-	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
-	UnifiedPayment,
+	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, PaymentDetailsPage,
+	SpontaneousPayment,
 };
+#[cfg(feature = "unified-payments")]
+use payment::{HRNResolver, UnifiedPayment};
 use peer_store::{PeerInfo, PeerStore};
+#[cfg(feature = "uniffi")]
+pub use probing::ArcedProbingConfigBuilder as ProbingConfigBuilder;
+use probing::{run_prober, Prober};
 use runtime::Runtime;
 pub use tokio;
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	HRNResolver, KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper,
-	Wallet,
+	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
 };
 pub use types::{
 	ChannelCounterparty, ChannelDetails, CustomTlvRecord, PeerDetails, ReserveType, UserChannelId,
 };
+#[cfg(feature = "storage-vss")]
 pub use vss_client;
 
-use crate::ffi::maybe_wrap;
+use crate::config::{LIQUIDITY_DISCOVERY_RETRY_INITIAL_DELAY, LIQUIDITY_DISCOVERY_RETRY_MAX_DELAY};
+use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::liquidity::Liquidity;
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
@@ -212,6 +226,19 @@ impl LeakChecker {
 			assert_eq!(weak.strong_count(), 0);
 		}
 	}
+}
+
+fn peer_may_negotiate_anchor_channel_type(
+	config: &Config, their_init_features: &InitFeatures,
+) -> bool {
+	their_init_features.supports_anchors_zero_fee_htlc_tx()
+		|| (config.anchor_channels_config.enable_zero_fee_commitments
+			&& their_init_features.supports_anchor_zero_fee_commitments())
+}
+
+fn requires_anchor_channel_type(channel_type: &ChannelTypeFeatures) -> bool {
+	channel_type.requires_anchors_zero_fee_htlc_tx()
+		|| channel_type.requires_anchor_zero_fee_commitments()
 }
 
 /// The main interface object of LDK Node, wrapping the necessary LDK and BDK functionalities.
@@ -249,7 +276,9 @@ pub struct Node {
 	node_metrics: Arc<PersistedNodeMetrics>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
+	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
+	prober: Option<Arc<Prober>>,
 	#[cfg(cycle_tests)]
 	_leak_checker: LeakChecker,
 }
@@ -270,6 +299,16 @@ impl Node {
 			return Err(Error::AlreadyRunning);
 		}
 
+		match self.start_inner(&mut is_running_lock) {
+			Ok(()) => Ok(()),
+			Err(e) => {
+				self.chain_source.stop();
+				Err(e)
+			},
+		}
+	}
+
+	fn start_inner(&self, is_running_lock: &mut bool) -> Result<(), Error> {
 		log_info!(
 			self.logger,
 			"Starting up LDK Node with node ID {} on network: {}",
@@ -285,9 +324,43 @@ impl Node {
 			e
 		})?;
 
-		// Block to ensure we update our fee rate cache once on startup
+		let manager_owns_any_0fc_channels =
+			self.channel_manager.list_channels().into_iter().any(|channel| {
+				channel
+					.channel_shutdown_state
+					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+					&& channel
+						.channel_type
+						.as_ref()
+						.map_or(false, |c| c.requires_anchor_zero_fee_commitments())
+			});
+		let monitor_owns_any_0fc_channels =
+			self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
+				self.chain_monitor
+					.get_monitor(channel_id)
+					.map(|monitor| {
+						monitor.channel_type_features().requires_anchor_zero_fee_commitments()
+					})
+					.unwrap_or(false)
+			});
+		let zero_fee_commitments_support_required = manager_owns_any_0fc_channels
+			|| monitor_owns_any_0fc_channels
+			|| self.config.anchor_channels_config.enable_zero_fee_commitments;
+
+		// Block to ensure we update our fee rate cache once on startup.
+		// Also take this opportunity to make sure our chain source supports 0FC channels
+		// if they are enabled.
+		//
+		// TODO: drop 0FC chain source validation when support is ubiquitous
 		let chain_source = Arc::clone(&self.chain_source);
-		self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
+		self.runtime.block_on(async move {
+			tokio::try_join!(
+				chain_source.update_fee_rate_estimates(),
+				chain_source.validate_zero_fee_commitments_support_if_required(
+					zero_fee_commitments_support_required
+				)
+			)
+		})?;
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
@@ -610,10 +683,18 @@ impl Node {
 			static_invoice_store,
 			Arc::clone(&self.onion_messenger),
 			self.om_mailbox.clone(),
+			self.prober.clone(),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 		));
+
+		if let Some(prober) = self.prober.clone() {
+			let stop_rx = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				run_prober(prober, stop_rx).await;
+			});
+		}
 
 		// Setup background processing
 		let background_persister = Arc::clone(&self.kv_store);
@@ -692,33 +773,7 @@ impl Node {
 				let logger = Arc::clone(&discovery_logger);
 				let ls = Arc::clone(&liquidity_handler);
 				discovery_set.spawn(async move {
-					if let Err(e) = cm.connect_peer_if_necessary(node_id, address.clone()).await {
-						log_error!(
-							logger,
-							"Failed to connect to LSP {} for protocol discovery: {}",
-							node_id,
-							e
-						);
-						return;
-					}
-					match ls.discover_lsp_protocols(&node_id).await {
-						Ok(protocols) => {
-							log_info!(
-								logger,
-								"Discovered protocols for LSP {}: {:?}",
-								node_id,
-								protocols
-							);
-						},
-						Err(e) => {
-							log_error!(
-								logger,
-								"Failed to discover protocols for LSP {}: {:?}",
-								node_id,
-								e
-							);
-						},
-					}
+					connect_and_discover_lsp(&cm, &ls, &logger, node_id, address).await;
 				});
 			}
 
@@ -748,6 +803,39 @@ impl Node {
 			}
 		});
 
+		// Retry protocol discovery for any LSPs that failed the startup batch, backing off up to a
+		// cap and then retrying at that cap until every configured LSP has been discovered.
+		let mut stop_retry = self.stop_sender.subscribe();
+		let retry_ls = Arc::clone(&self.liquidity_source);
+		let retry_logger = Arc::clone(&self.logger);
+		let retry_cm = Arc::clone(&self.connection_manager);
+		self.runtime.spawn_cancellable_background_task(async move {
+			let mut backoff = LIQUIDITY_DISCOVERY_RETRY_INITIAL_DELAY;
+			loop {
+				tokio::select! {
+						_ = stop_retry.changed() => return,
+						_ = tokio::time::sleep(backoff) => {},
+				}
+
+				let undiscovered_lsps = retry_ls.get_undiscovered_lsps();
+				if undiscovered_lsps.is_empty() {
+					break;
+				}
+
+				let mut discovery_set = tokio::task::JoinSet::new();
+				for (node_id, address) in undiscovered_lsps {
+					let cm = Arc::clone(&retry_cm);
+					let ls = Arc::clone(&retry_ls);
+					let logger = Arc::clone(&retry_logger);
+					discovery_set.spawn(async move {
+						connect_and_discover_lsp(&cm, &ls, &logger, node_id, address).await;
+					});
+				}
+				discovery_set.join_all().await;
+				backoff = (backoff * 2).min(LIQUIDITY_DISCOVERY_RETRY_MAX_DELAY);
+			}
+		});
+
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
 		Ok(())
@@ -763,6 +851,10 @@ impl Node {
 		}
 
 		log_info!(self.logger, "Shutting down LDK Node with node ID {}...", self.node_id());
+
+		// Prevent blocking Electrum syncs from making any further callbacks before persistence
+		// tasks stop accepting work.
+		self.chain_source.begin_shutdown();
 
 		// Stop background tasks.
 		self.stop_sender
@@ -1043,6 +1135,7 @@ impl Node {
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 		)
 	}
@@ -1055,6 +1148,7 @@ impl Node {
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 		))
 	}
@@ -1068,7 +1162,7 @@ impl Node {
 	/// [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 	/// [BIP 21]: https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki
 	/// [BIP 353]: https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki
-	#[cfg(not(feature = "uniffi"))]
+	#[cfg(all(feature = "unified-payments", not(feature = "uniffi")))]
 	pub fn unified_payment(&self) -> UnifiedPayment {
 		UnifiedPayment::new(
 			self.onchain_payment().into(),
@@ -1079,7 +1173,11 @@ impl Node {
 			self.hrn_resolver.clone(),
 		)
 	}
+}
 
+#[cfg(all(feature = "unified-payments", feature = "uniffi"))]
+#[uniffi::export]
+impl Node {
 	/// Returns a payment handler that supports creating and paying to [BIP 21] URIs with on-chain,
 	/// [BOLT 11], and [BOLT 12] payment options.
 	///
@@ -1089,7 +1187,6 @@ impl Node {
 	/// [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 	/// [BIP 21]: https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki
 	/// [BIP 353]: https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki
-	#[cfg(feature = "uniffi")]
 	pub fn unified_payment(&self) -> Arc<UnifiedPayment> {
 		Arc::new(UnifiedPayment::new(
 			self.onchain_payment(),
@@ -1100,7 +1197,9 @@ impl Node {
 			self.hrn_resolver.clone(),
 		))
 	}
+}
 
+impl Node {
 	/// Authenticates the user via [LNURL-auth] for the given LNURL string.
 	///
 	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
@@ -1145,12 +1244,17 @@ impl Node {
 		))
 	}
 
+	/// Returns a reference to the [`Prober`], or `None` if no probing strategy is configured.
+	pub fn prober(&self) -> Option<&Prober> {
+		self.prober.as_deref()
+	}
+
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
 		self.channel_manager
 			.list_channels()
 			.into_iter()
-			.map(|c| ChannelDetails::from_ldk(c, self.config.anchor_channels_config.as_ref()))
+			.map(|c| ChannelDetails::from_ldk(c, &self.config.anchor_channels_config))
 			.collect()
 	}
 
@@ -1232,7 +1336,7 @@ impl Node {
 			FundingAmount::Exact { amount_sats } => {
 				// Check funds availability after connection (includes anchor reserve
 				// calculation).
-				self.check_sufficient_funds_for_channel(amount_sats, &peer_info.node_id)?;
+				self.check_sufficient_onchain_funds(amount_sats, &peer_info.node_id, true)?;
 				amount_sats
 			},
 			FundingAmount::Max => {
@@ -1334,37 +1438,41 @@ impl Node {
 			.peer_by_node_id(peer_node_id)
 			.ok_or(Error::ConnectionFailed)?
 			.init_features;
-		let anchor_channel = init_features.requires_anchors_zero_fee_htlc_tx();
+		let anchor_channel = peer_may_negotiate_anchor_channel_type(&self.config, &init_features);
 		Ok(new_channel_anchor_reserve_sats(&self.config, peer_node_id, anchor_channel))
 	}
 
-	fn check_sufficient_funds_for_channel(
-		&self, amount_sats: u64, peer_node_id: &PublicKey,
+	fn check_sufficient_onchain_funds(
+		&self, amount_sats: u64, peer_node_id: &PublicKey, for_new_channel: bool,
 	) -> Result<(), Error> {
+		let action_str = if for_new_channel { "create channel" } else { "splice-in" };
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
-		// Fail early if we have less than the channel value available.
 		if spendable_amount_sats < amount_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, amount_sats
+			log_error!(
+				self.logger,
+				"Unable to {} due to insufficient funds. Available: {}sats, Required: {}sats",
+				action_str,
+				spendable_amount_sats,
+				amount_sats
 			);
 			return Err(Error::InsufficientFunds);
 		}
 
-		// Fail if we have less than the channel value + anchor reserve available (if applicable).
-		let required_funds_sats =
-			amount_sats + self.new_channel_anchor_reserve_sats(peer_node_id)?;
+		if for_new_channel {
+			let required_funds_sats =
+				amount_sats + self.new_channel_anchor_reserve_sats(peer_node_id)?;
 
-		if spendable_amount_sats < required_funds_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, required_funds_sats
-			);
-			return Err(Error::InsufficientFunds);
+			if spendable_amount_sats < required_funds_sats {
+				log_error!(self.logger,
+					"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+					spendable_amount_sats, required_funds_sats
+				);
+				return Err(Error::InsufficientFunds);
+			}
 		}
 
 		Ok(())
@@ -1640,7 +1748,7 @@ impl Node {
 				},
 			};
 
-			self.check_sufficient_funds_for_channel(splice_amount_sats, &counterparty_node_id)?;
+			self.check_sufficient_onchain_funds(splice_amount_sats, &counterparty_node_id, false)?;
 
 			let funding_template = self
 				.channel_manager
@@ -2010,10 +2118,11 @@ impl Node {
 					})?;
 			}
 
-			// Check if this was the last open channel, if so, forget the peer.
-			if open_channels.len() == 1 {
-				self.runtime.block_on(self.peer_store.remove_peer(&counterparty_node_id))?;
-			}
+			// Peer store cleanup is handled centrally in the `ChannelClosed` event handler,
+			// which retains a force-closed peer through one recovery reconnect before
+			// dropping it. This lets `channel_reestablish` drive the recovery flow, which is
+			// especially important against LND peers that don't always handle force-closure
+			// error messages correctly.
 		}
 
 		Ok(())
@@ -2043,9 +2152,10 @@ impl Node {
 
 	/// Retrieve the details of a specific payment with the given id.
 	///
-	/// Returns `Some` if the payment was known and `None` otherwise.
-	pub fn payment(&self, payment_id: &PaymentId) -> Option<PaymentDetails> {
-		self.payment_store.get(payment_id)
+	/// Returns `Ok(Some(..))` if the payment was known and `Ok(None)` otherwise. Returns an error
+	/// if the payment could not be retrieved from the store.
+	pub fn payment(&self, payment_id: &PaymentId) -> Result<Option<PaymentDetails>, Error> {
+		self.runtime.block_on(self.payment_store.get(payment_id))
 	}
 
 	/// Remove the payment with the given id from the store.
@@ -2101,15 +2211,31 @@ impl Node {
 		}
 	}
 
-	/// Retrieves all payments that match the given predicate.
+	/// Retrieves a page of payments, ordered from most recently created to least recently created.
+	///
+	/// Pass `None` to start at the most recently created payment, and the
+	/// [`PaymentDetailsPage::next_page_token`] returned by the previous call to continue from
+	/// where it left off. Ordering, pagination, and token lifetime are determined by the configured
+	/// storage backend, including whether a token remains valid across restarts of the node.
+	///
+	/// Payments created or removed while paginating may or may not be observed. Because the
+	/// ordering is by creation, a payment that exists throughout is never skipped nor returned
+	/// twice, but a page may hold fewer payments than the backend's page size. Iterate until
+	/// `next_page_token` is `None` rather than until a short page.
+	///
+	/// Note that migrating between storage backends does not preserve the relative creation order
+	/// of pre-existing payments, so their order may change once after such a migration.
 	///
 	/// For example, you could retrieve all stored outbound payments as follows:
 	/// ```
+	/// # #[cfg(not(feature = "uniffi"))]
+	/// # fn main() -> Result<(), ldk_node::NodeError> {
 	/// # use ldk_node::Builder;
 	/// # use ldk_node::config::Config;
-	/// # use ldk_node::payment::PaymentDirection;
+	/// # use ldk_node::payment::{PaymentDetails, PaymentDirection};
 	/// # use ldk_node::bitcoin::Network;
-	/// # use ldk_node::entropy::{generate_entropy_mnemonic, NodeEntropy};
+	/// # use ldk_node::bip39::Mnemonic;
+	/// # use ldk_node::entropy::NodeEntropy;
 	/// # use rand::distr::Alphanumeric;
 	/// # use rand::{rng, Rng};
 	/// # let mut config = Config::default();
@@ -2119,20 +2245,35 @@ impl Node {
 	/// # temp_path.push(rand_dir);
 	/// # config.storage_dir_path = temp_path.display().to_string();
 	/// # let builder = Builder::from_config(config);
-	/// # let mnemonic = generate_entropy_mnemonic(None);
+	/// # let mnemonic = Mnemonic::generate(24).unwrap();
 	/// # let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
 	/// # let node = builder.build(node_entropy.into()).unwrap();
-	/// node.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound);
+	/// let mut outbound = Vec::new();
+	/// let mut page_token = None;
+	/// loop {
+	/// 	let page = node.list_payments(page_token)?;
+	/// 	outbound.extend(
+	/// 		page.payments.into_iter().filter(|p| p.direction == PaymentDirection::Outbound),
+	/// 	);
+	/// 	match page.next_page_token {
+	/// 		Some(token) => page_token = Some(token),
+	/// 		None => break,
+	/// 	}
+	/// }
+	/// # Ok(())
+	/// # }
+	/// # #[cfg(feature = "uniffi")]
+	/// # fn main() {}
 	/// ```
-	pub fn list_payments_with_filter<F: FnMut(&&PaymentDetails) -> bool>(
-		&self, f: F,
-	) -> Vec<PaymentDetails> {
-		self.payment_store.list_filter(f)
-	}
-
-	/// Retrieves all payments.
-	pub fn list_payments(&self) -> Vec<PaymentDetails> {
-		self.payment_store.list_filter(|_| true)
+	pub fn list_payments(
+		&self, page_token: Option<payment::PageToken>,
+	) -> Result<PaymentDetailsPage, Error> {
+		let ldk_page_token = page_token.as_ref().map(|token| maybe_deref(token).clone());
+		let page = self.runtime.block_on(self.payment_store.list_page(ldk_page_token))?;
+		Ok(PaymentDetailsPage {
+			payments: page.objects,
+			next_page_token: page.next_page_token.map(maybe_wrap),
+		})
 	}
 
 	/// Retrieves a list of known peers.
@@ -2380,21 +2521,20 @@ impl_writeable_tlv_based!(NodeMetrics, {
 pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
-	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
-		channel_manager
-			.list_channels()
-			.into_iter()
-			.filter(|c| {
-				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
-					&& c.channel_shutdown_state
-						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& c.channel_type
-						.as_ref()
-						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
-			})
-			.count() as u64
-			* anchor_channels_config.per_channel_reserve_sats
-	})
+	channel_manager
+		.list_channels()
+		.into_iter()
+		.filter(|c| {
+			!config
+				.anchor_channels_config
+				.trusted_peers_no_reserve
+				.contains(&c.counterparty.node_id)
+				&& c.channel_shutdown_state
+					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+				&& c.channel_type.as_ref().map_or(false, requires_anchor_channel_type)
+		})
+		.count() as u64
+		* config.anchor_channels_config.per_channel_reserve_sats
 }
 
 pub(crate) fn new_channel_anchor_reserve_sats(
@@ -2404,13 +2544,28 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 		return 0;
 	}
 
-	config.anchor_channels_config.as_ref().map_or(0, |c| {
-		if c.trusted_peers_no_reserve.contains(peer_node_id) {
-			0
-		} else {
-			c.per_channel_reserve_sats
-		}
-	})
+	if config.anchor_channels_config.trusted_peers_no_reserve.contains(peer_node_id) {
+		0
+	} else {
+		config.anchor_channels_config.per_channel_reserve_sats
+	}
+}
+
+async fn connect_and_discover_lsp(
+	connection_manager: &ConnectionManager<Arc<Logger>>,
+	liquidity_source: &LiquiditySource<Arc<Logger>>, logger: &Logger, node_id: PublicKey,
+	address: SocketAddress,
+) {
+	if let Err(e) = connection_manager.connect_peer_if_necessary(node_id, address).await {
+		log_debug!(logger, "Failed to connect to LSP {} for protocol discovery: {}", node_id, e);
+		return;
+	}
+	match liquidity_source.discover_lsp_protocols(&node_id).await {
+		Ok(protocols) => {
+			log_info!(logger, "Discovered protocols for LSP {}: {:?}", node_id, protocols)
+		},
+		Err(e) => log_debug!(logger, "Protocol discovery failed for LSP {}: {:?}", node_id, e),
+	}
 }
 
 #[cfg(test)]
