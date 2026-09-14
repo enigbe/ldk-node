@@ -93,6 +93,20 @@ fun waitForBlock(esploraEndpoint: String, blockHash: String) {
     }
 }
 
+fun closeChannelWithRetry(closeChannel: () -> Unit) {
+    repeat(50) { attempt ->
+        try {
+            closeChannel()
+            return
+        } catch (exception: NodeException.ChannelClosingFailed) {
+            if (attempt == 49) {
+                throw exception
+            }
+            Thread.sleep(100)
+        }
+    }
+}
+
 class CustomLogWriter(private var currentLogLevel: LogLevel = LogLevel.INFO) :
     LogWriter {
     enum class LogLevel {
@@ -193,11 +207,11 @@ class LibraryTest {
         builder2.setChainSourceEsplora(esploraEndpoint, null)
         builder2.setCustomLogger(logWriter2)
 
-        val mnemonic1 = generateEntropyMnemonic(null)
+        val mnemonic1 = Mnemonic.generate(24u)
         val nodeEntropy1 = NodeEntropy.fromBip39Mnemonic(mnemonic1, null)
         val node1 = builder1.build(nodeEntropy1)
 
-        val mnemonic2 = generateEntropyMnemonic(null)
+        val mnemonic2 = Mnemonic.generate(24u)
         val nodeEntropy2 = NodeEntropy.fromBip39Mnemonic(mnemonic2, null)
         val node2 = builder2.build(nodeEntropy2)
 
@@ -301,10 +315,14 @@ class LibraryTest {
         assert(paymentReceivedEvent is Event.PaymentReceived)
         node2.eventHandled()
 
-        assert(node1.listPayments().size == 3)
-        assert(node2.listPayments().size == 2)
+        assert(node1.listPayments(null).payments.size == 3)
+        assert(node2.listPayments(null).payments.size == 2)
 
-        node2.closeChannel(userChannelId, nodeId1)
+        // A page token has to survive a round trip through a string, so that an app can persist
+        // one and resume paginating after a restart.
+        assert(PageToken("some-page-token").toString() == "some-page-token")
+
+        closeChannelWithRetry { node2.closeChannel(userChannelId, nodeId1) }
 
         val channelClosedEvent1 = node1.waitNextEvent()
         println("Got event: $channelClosedEvent1")

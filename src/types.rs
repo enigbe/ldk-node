@@ -12,12 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{OutPoint, ScriptBuf};
-use bitcoin_payment_instructions::amount::Amount as BPIAmount;
-use bitcoin_payment_instructions::dns_resolver::DNSHrnResolver;
-use bitcoin_payment_instructions::hrn_resolution::{
-	HrnResolutionFuture, HrnResolver, HumanReadableName, LNURLResolutionFuture,
-};
-use bitcoin_payment_instructions::onion_message_resolver::LDKOnionMessageDNSSECHrnResolver;
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::{
@@ -36,14 +30,14 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning::util::sweep::OutputSweeper;
-use lightning_block_sync::gossip::GossipVerifier;
 use lightning_liquidity::utils::time::DefaultTimeProvider;
 use lightning_net_tokio::SocketDescriptor;
+#[cfg(not(feature = "uniffi"))]
+use lightning_types::features::ChannelTypeFeatures;
 
-use crate::chain::bitcoind::UtxoSourceClient;
 use crate::chain::ChainSource;
 use crate::config::{AnchorChannelsConfig, ChannelConfig};
-use crate::data_store::DataStore;
+use crate::data_store::{DataStore, KeepAllEntries, KeepLeastRecentlyUsed};
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::ffi::maybe_wrap;
 use crate::logger::Logger;
@@ -51,6 +45,8 @@ use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::{PaymentDetails, PendingPaymentDetails};
 use crate::runtime::RuntimeSpawner;
 
+#[cfg(feature = "uniffi")]
+type ChannelTypeFeatures = Arc<crate::ffi::ChannelTypeFeatures>;
 #[cfg(not(feature = "uniffi"))]
 type InitFeatures = lightning::types::features::InitFeatures;
 #[cfg(feature = "uniffi")]
@@ -285,7 +281,7 @@ pub(crate) type Scorer = CombinedScorer<Arc<Graph>, Arc<Logger>>;
 
 pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
 
-pub(crate) type UtxoLookup = GossipVerifier<RuntimeSpawner, Arc<UtxoSourceClient>>;
+pub(crate) type UtxoLookup = dyn lightning::routing::utxo::UtxoLookup + Send + Sync;
 
 pub(crate) type P2PGossipSync =
 	lightning::routing::gossip::P2PGossipSync<Arc<Graph>, Arc<UtxoLookup>, Arc<Logger>>;
@@ -312,41 +308,6 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	IgnoringMessageHandler,
 >;
 
-#[derive(Clone)]
-pub enum HRNResolver {
-	Onion(Arc<LDKOnionMessageDNSSECHrnResolver<Arc<Graph>, Arc<Logger>>>),
-	Local(Arc<DNSHrnResolver>),
-}
-
-impl HrnResolver for HRNResolver {
-	fn resolve_hrn<'a>(&'a self, hrn: &'a HumanReadableName) -> HrnResolutionFuture<'a> {
-		match self {
-			HRNResolver::Onion(inner) => inner.resolve_hrn(hrn),
-			HRNResolver::Local(inner) => inner.resolve_hrn(hrn),
-		}
-	}
-
-	fn resolve_lnurl<'a>(&'a self, url: &'a str) -> HrnResolutionFuture<'a> {
-		match self {
-			HRNResolver::Onion(inner) => inner.resolve_lnurl(url),
-			HRNResolver::Local(inner) => inner.resolve_lnurl(url),
-		}
-	}
-
-	fn resolve_lnurl_to_invoice<'a>(
-		&'a self, callback_url: String, amount: BPIAmount, expected_description_hash: [u8; 32],
-	) -> LNURLResolutionFuture<'a> {
-		match self {
-			HRNResolver::Onion(inner) => {
-				inner.resolve_lnurl_to_invoice(callback_url, amount, expected_description_hash)
-			},
-			HRNResolver::Local(inner) => {
-				inner.resolve_lnurl_to_invoice(callback_url, amount, expected_description_hash)
-			},
-		}
-	}
-}
-
 pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
 	Arc<Logger>,
@@ -371,7 +332,7 @@ pub(crate) type BumpTransactionEventHandler =
 		Arc<Logger>,
 	>;
 
-pub(crate) type PaymentStore = DataStore<PaymentDetails, Arc<Logger>>;
+pub(crate) type PaymentStore = DataStore<PaymentDetails, Arc<Logger>, KeepLeastRecentlyUsed>;
 
 /// A local, potentially user-provided, identifier of a channel.
 ///
@@ -642,28 +603,25 @@ pub struct ChannelDetails {
 	///
 	/// See [`ReserveType`] for details on how reserves differ between anchor and legacy channels.
 	pub reserve_type: Option<ReserveType>,
+	/// The negotiated channel type features.
+	///
+	/// Will be `None` until channel negotiation has completed and the channel type has been
+	/// determined.
+	pub channel_type: Option<ChannelTypeFeatures>,
 }
 
 impl ChannelDetails {
 	pub(crate) fn from_ldk(
-		value: LdkChannelDetails, anchor_channels_config: Option<&AnchorChannelsConfig>,
+		value: LdkChannelDetails, anchor_channels_config: &AnchorChannelsConfig,
 	) -> Self {
 		let reserve_type = value.channel_type.as_ref().map(|channel_type| {
-			if channel_type.supports_anchors_zero_fee_htlc_tx() {
-				if let Some(config) = anchor_channels_config {
-					if config.trusted_peers_no_reserve.contains(&value.counterparty.node_id) {
-						ReserveType::TrustedPeersNoReserve
-					} else {
-						ReserveType::Adaptive
-					}
+			if crate::requires_anchor_channel_type(channel_type) {
+				if anchor_channels_config
+					.trusted_peers_no_reserve
+					.contains(&value.counterparty.node_id)
+				{
+					ReserveType::TrustedPeersNoReserve
 				} else {
-					// Edge case: if `AnchorChannelsConfig` was previously set and later
-					// removed, we can no longer distinguish whether this anchor channel's
-					// reserve was `Adaptive` or `TrustedPeersNoReserve`. We default to
-					// `Adaptive` here, which may incorrectly override a prior
-					// `TrustedPeersNoReserve` designation. This is acceptable since
-					// unsetting `AnchorChannelsConfig` on a node with existing anchor
-					// channels is not an expected operation.
 					ReserveType::Adaptive
 				}
 			} else {
@@ -714,6 +672,7 @@ impl ChannelDetails {
 				.expect("value is set for objects serialized with LDK v0.0.109+"),
 			channel_shutdown_state: value.channel_shutdown_state,
 			reserve_type,
+			channel_type: value.channel_type.map(maybe_wrap),
 		}
 	}
 }
@@ -755,4 +714,4 @@ impl From<&(u64, Vec<u8>)> for CustomTlvRecord {
 	}
 }
 
-pub(crate) type PendingPaymentStore = DataStore<PendingPaymentDetails, Arc<Logger>>;
+pub(crate) type PendingPaymentStore = DataStore<PendingPaymentDetails, Arc<Logger>, KeepAllEntries>;

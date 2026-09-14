@@ -10,6 +10,8 @@
 use core::fmt;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,6 +23,16 @@ pub use lightning::util::logger::Level as LogLevel;
 pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
 pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace, log_warn};
 use log::{Level as LogFacadeLevel, Record as LogFacadeRecord};
+
+use crate::io::utils::create_dir_all_private;
+
+fn open_log_file(file_path: &str) -> std::io::Result<fs::File> {
+	let mut options = fs::OpenOptions::new();
+	options.create(true).append(true);
+	#[cfg(unix)]
+	options.mode(0o600);
+	options.open(file_path)
+}
 
 /// A unit of logging output with metadata to enable filtering `module_path`,
 /// `file`, and `line` to inform on log's source.
@@ -208,10 +220,7 @@ impl LogWriter for Writer {
 					context,
 				);
 
-				fs::OpenOptions::new()
-					.create(true)
-					.append(true)
-					.open(file_path)
+				open_log_file(file_path)
 					.expect("Failed to open log file")
 					.write_all(log.as_bytes())
 					.expect("Failed to write to log file")
@@ -261,14 +270,11 @@ impl Logger {
 	/// are the path to the log file, and the log level.
 	pub fn new_fs_writer(file_path: String, max_log_level: LogLevel) -> Result<Self, ()> {
 		if let Some(parent_dir) = Path::new(&file_path).parent() {
-			fs::create_dir_all(parent_dir)
+			create_dir_all_private(parent_dir)
 				.map_err(|e| eprintln!("ERROR: Failed to create log parent directory: {}", e))?;
 
 			// make sure the file exists.
-			fs::OpenOptions::new()
-				.create(true)
-				.append(true)
-				.open(&file_path)
+			open_log_file(&file_path)
 				.map_err(|e| eprintln!("ERROR: Failed to open log file: {}", e))?;
 		}
 
@@ -308,6 +314,23 @@ mod tests {
 	use std::sync::Mutex;
 
 	use super::*;
+	#[cfg(unix)]
+	use crate::io::test_utils::random_storage_path;
+
+	#[cfg(unix)]
+	#[test]
+	fn creates_private_log_file() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let log_dir = random_storage_path();
+		let log_path = log_dir.join("ldk_node.log");
+		let _logger =
+			Logger::new_fs_writer(log_path.to_str().unwrap().to_string(), LogLevel::Info).unwrap();
+
+		let mode = log_path.metadata().unwrap().permissions().mode();
+		assert_eq!(mode & 0o077, 0);
+		fs::remove_dir_all(log_dir).unwrap();
+	}
 
 	/// A minimal log facade logger that captures log output for testing.
 	struct TestLogger {

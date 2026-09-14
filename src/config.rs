@@ -8,6 +8,7 @@
 //! Objects for configuring the node.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,6 +29,12 @@ const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
+pub(crate) const DEFAULT_PROBING_INTERVAL_SECS: u64 = 10;
+pub(crate) const MIN_PROBING_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const DEFAULT_PROBED_NODE_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
+pub(crate) const DEFAULT_MAX_PROBE_LOCKED_MSAT: u64 = 100_000_000; // 100k sats
+pub(crate) const DEFAULT_MIN_PROBE_AMOUNT_MSAT: u64 = 1_000_000; // 1k sats
+pub(crate) const DEFAULT_MAX_PROBE_AMOUNT_MSAT: u64 = 10_000_000; // 10k sats
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
 // The default timeout after which we abort a wallet syncing operation.
@@ -42,6 +49,22 @@ pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS: u64 = 10;
 // The default timeout after which we abort a transaction broadcast operation.
 pub(crate) const DEFAULT_TX_BROADCAST_TIMEOUT_SECS: u64 = 10;
 
+// The number of payments we keep in memory.
+//
+// The payment history grows for the lifetime of a node, so we cache only the most recently used
+// payments and read the rest back from the store as they are needed. At roughly 400 to 500 bytes
+// per cached payment, this bounds the payment store's share of memory at well under a megabyte,
+// while still covering the recent payments a node actually works with.
+pub(crate) const PAYMENT_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+
+// The number of payments we read into the cache when starting up.
+//
+// This matches the built-in storage backends' page size, so warming the cache costs a single page
+// listing and one batch of reads. Immediately after startup, a first-page `Node::list_payments`
+// call reads only its keys from storage; the payment bodies come from the cache. Later activity
+// may displace those entries.
+pub(crate) const PAYMENT_CACHE_WARMUP_COUNT: NonZeroUsize = NonZeroUsize::new(50).unwrap();
+
 // The default {Esplora,Electrum} client timeout we're using.
 const DEFAULT_PER_REQUEST_TIMEOUT_SECS: u8 = 10;
 
@@ -54,7 +77,8 @@ pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
 /// The default storage directory.
 pub const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
 
-// The default Esplora server we're using.
+// The default Esplora server we're using. It supports `submitpackage`, check using POST on the
+// `/txs/package` endpoint.
 pub(crate) const DEFAULT_ESPLORA_SERVER_URL: &str = "https://blockstream.info/api";
 
 /// The default stop gap used for BDK full scans of the on-chain wallet.
@@ -71,6 +95,22 @@ pub const MIN_FULL_SCAN_STOP_GAP: u32 = 1;
 ///
 /// Values above 1000 are clamped to 1000 when a full scan runs.
 pub const MAX_FULL_SCAN_STOP_GAP: u32 = 1000;
+
+/// The number of addresses the node keeps revealed and persisted ahead of use, from which it
+/// serves fresh-address requests and channel destination and shutdown scripts.
+///
+/// Pooled addresses are revealed-but-unused wallet scripts. Addresses are handed out oldest
+/// first, which keeps the pool beyond the handed-out addresses, where it cannot hide funds
+/// from a full scan's stop gap (e.g. [`EsploraSyncConfig::full_scan_stop_gap`]). A handout
+/// that fails while a concurrent one proceeds can briefly leave a pooled address below a
+/// handed-out one; such inversions are bounded by the pool size and consumed by the next
+/// handouts.
+///
+/// After a restore from seed, the pool refills from the keychain's first indices before the
+/// initial full scan runs, so it can serve addresses a previous installation of the wallet
+/// already handed out — possibly even used ones. The cost is address reuse, not fund
+/// visibility: the reveals keep the scripts watched and the scan discovers any prior use.
+pub const ADDRESS_POOL_SIZE: u32 = 16;
 
 // The number of concurrent requests made against the API provider.
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
@@ -122,6 +162,13 @@ pub(crate) const HRN_RESOLUTION_TIMEOUT_SECS: u64 = 5;
 // The timeout after which we abort an LNURL-auth operation.
 pub(crate) const LNURL_AUTH_TIMEOUT_SECS: u64 = 15;
 
+// The initial delay before retrying a failed liquidity protocol discovery operation.
+pub(crate) const LIQUIDITY_DISCOVERY_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+
+// The maximum delay the discovery-retry backoff ramps up to, and the interval it keeps retrying at
+// thereafter until every configured LSP has been discovered.
+pub(crate) const LIQUIDITY_DISCOVERY_RETRY_MAX_DELAY: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 /// Represents the configuration of an [`Node`] instance.
@@ -137,10 +184,14 @@ pub(crate) const LNURL_AUTH_TIMEOUT_SECS: u64 = 15;
 /// | `node_alias`                           | None                                 |
 /// | `trusted_peers_0conf`                  | []                                   |
 /// | `probing_liquidity_limit_multiplier`   | 3                                    |
-/// | `anchor_channels_config`               | Some(..)                             |
+/// | `anchor_channels_config`               | AnchorChannelsConfig::default()      |
 /// | `route_parameters`                     | None                                 |
 /// | `tor_config`                           | None                                 |
-/// | `hrn_config`                           | HumanReadableNamesConfig::default()  |
+#[cfg_attr(
+	feature = "unified-payments",
+	doc = "| `hrn_config`                           | HumanReadableNamesConfig::default()  |"
+)]
+/// | `manually_handle_unknown_bolt11_payments` | false                              |
 ///
 /// See [`AnchorChannelsConfig`] and [`RouteParametersConfig`] for more information regarding their
 /// respective default values.
@@ -181,22 +232,11 @@ pub struct Config {
 	/// used to send pre-flight probes.
 	pub probing_liquidity_limit_multiplier: u64,
 	/// Configuration options pertaining to Anchor channels, i.e., channels for which the
-	/// `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
+	/// `option_zero_fee_commitments` or `option_anchors_zero_fee_htlc_tx` channel type is
+	/// negotiated.
 	///
 	/// Please refer to [`AnchorChannelsConfig`] for further information on Anchor channels.
-	///
-	/// If set to `Some`, we'll try to open new channels with Anchors enabled, i.e., new channels
-	/// will be negotiated with the `option_anchors_zero_fee_htlc_tx` channel type if supported by
-	/// the counterparty. Note that this won't prevent us from opening non-Anchor channels if the
-	/// counterparty doesn't support `option_anchors_zero_fee_htlc_tx`. If set to `None`, new
-	/// channels will be negotiated with the legacy `option_static_remotekey` channel type only.
-	///
-	/// **Note:** If set to `None` *after* some Anchor channels have already been
-	/// opened, no dedicated emergency on-chain reserve will be maintained for these channels,
-	/// which can be dangerous if only insufficient funds are available at the time of channel
-	/// closure. We *will* however still try to get the Anchor spending transactions confirmed
-	/// on-chain with the funds available.
-	pub anchor_channels_config: Option<AnchorChannelsConfig>,
+	pub anchor_channels_config: AnchorChannelsConfig,
 	/// Configuration options for payment routing and pathfinding.
 	///
 	/// Setting the [`RouteParametersConfig`] provides flexibility to customize how payments are routed,
@@ -215,7 +255,19 @@ pub struct Config {
 	/// Configuration options for Human-Readable Names ([BIP 353]).
 	///
 	/// [BIP 353]: https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki
+	#[cfg(feature = "unified-payments")]
 	pub hrn_config: HumanReadableNamesConfig,
+	/// Whether to emit [`Event::PaymentClaimable`] for unknown BOLT 11 payments that were created
+	/// with a user-provided payment hash and therefore need to be manually claimed.
+	///
+	/// If disabled, such payments are failed back without being added to the payment store.
+	///
+	/// **Warning:** Enabling this may let any holder of a valid invoice generated by this node tie
+	/// up inbound HTLC slots and grow the persisted event queue until the payment is claimed,
+	/// failed, or times out.
+	///
+	/// [`Event::PaymentClaimable`]: crate::Event::PaymentClaimable
+	pub manually_handle_unknown_bolt11_payments: bool,
 }
 
 impl Default for Config {
@@ -227,11 +279,13 @@ impl Default for Config {
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
-			anchor_channels_config: Some(AnchorChannelsConfig::default()),
+			anchor_channels_config: AnchorChannelsConfig::default(),
 			tor_config: None,
 			route_parameters: None,
 			node_alias: None,
+			#[cfg(feature = "unified-payments")]
 			hrn_config: HumanReadableNamesConfig::default(),
+			manually_handle_unknown_bolt11_payments: false,
 		}
 	}
 }
@@ -292,7 +346,7 @@ impl Default for HumanReadableNamesConfig {
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the
-/// `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
+/// `option_zero_fee_commitments` or `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
 ///
 /// Prior to the introduction of Anchor channels, the on-chain fees paying for the transactions
 /// issued on channel closure were pre-determined and locked-in at the time of the channel
@@ -311,10 +365,11 @@ impl Default for HumanReadableNamesConfig {
 ///
 /// ### Defaults
 ///
-/// | Parameter                  | Value  |
-/// |----------------------------|--------|
-/// | `trusted_peers_no_reserve` | []     |
-/// | `per_channel_reserve_sats` | 25000  |
+/// | Parameter                     | Value  |
+/// |-------------------------------|--------|
+/// | `trusted_peers_no_reserve`    | []     |
+/// | `per_channel_reserve_sats`    | 25000  |
+/// | `enable_zero_fee_commitments` | false  |
 ///
 ///
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
@@ -350,6 +405,21 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
+	/// If set, we will first attempt to negotiate `option_zero_fee_commitments` before falling
+	/// back to `option_anchors_zero_fee_htlc_tx` and `option_static_remotekey`, as supported by
+	/// the peer. Zero-fee commitment channels remove all commitment feerate negotiation from
+	/// the channel, which eliminates a very common source of channel force-closures. These
+	/// channels instead source *all* the fees required to confirm the commitment from the
+	/// anchor reserve of the channel closer at the time of force-close. If set, your chain
+	/// source *must* support the `submitpackage` Bitcoin Core RPC, and relay [TRUC], [P2A],
+	/// and [Ephemeral Dust].
+	/// See [BOLT 3] for more technical details.
+	///
+	/// [TRUC]: https://github.com/bitcoin/bips/blob/master/bip-0431.mediawiki
+	/// [P2A]: https://github.com/bitcoin/bips/blob/master/bip-0433.mediawiki
+	/// [Ephemeral Dust]: https://bitcoincore.org/en/releases/29.0
+	/// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#shared_anchor-output-zero_fee_commitments
+	pub enable_zero_fee_commitments: bool,
 }
 
 impl Default for AnchorChannelsConfig {
@@ -357,6 +427,7 @@ impl Default for AnchorChannelsConfig {
 		Self {
 			trusted_peers_no_reserve: Vec::new(),
 			per_channel_reserve_sats: DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS,
+			enable_zero_fee_commitments: false,
 		}
 	}
 }
@@ -412,8 +483,8 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// will mostly be relevant for inbound channels.
 	let mut user_config = UserConfig::default();
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
-	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
-		config.anchor_channels_config.is_some();
+	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
+		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
 
 	if may_announce_channel(config).is_err() {

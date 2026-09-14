@@ -5,9 +5,9 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_chain::bdk_core::spk_client::{
@@ -16,6 +16,7 @@ use bdk_chain::bdk_core::spk_client::{
 };
 use bdk_electrum::BdkElectrumClient;
 use bdk_wallet::{KeychainKind as BdkKeyChainKind, Update as BdkUpdate};
+use bitcoin::transaction::Version;
 use bitcoin::{FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
 use electrum_client::{
 	Batch, Client as ElectrumClient, ConfigBuilder as ElectrumConfigBuilder, ElectrumApi,
@@ -24,7 +25,7 @@ use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
 use lightning_transaction_sync::ElectrumSyncClient;
 
-use super::WalletSyncStatus;
+use super::{WalletSyncGuard, WalletSyncStatus};
 use crate::config::{
 	clamp_full_scan_stop_gap, Config, ElectrumSyncConfig, MAX_FULL_SCAN_STOP_GAP,
 	MIN_FULL_SCAN_STOP_GAP,
@@ -37,6 +38,7 @@ use crate::fee_estimator::{
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_trace, log_warn, LdkLogger, Logger};
 use crate::runtime::Runtime;
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::PersistedNodeMetrics;
 
@@ -93,7 +95,17 @@ impl ElectrumChainSource {
 	}
 
 	pub(super) fn stop(&self) {
-		self.electrum_runtime_status.write().expect("lock").stop();
+		let client = self.electrum_runtime_status.write().expect("lock").stop();
+		if let Some(client) = client {
+			client.begin_shutdown();
+		}
+	}
+
+	pub(super) fn begin_shutdown(&self) {
+		let client = self.electrum_runtime_status.read().expect("lock").client();
+		if let Some(client) = client {
+			client.begin_shutdown();
+		}
 	}
 
 	pub(crate) async fn sync_onchain_wallet(
@@ -111,10 +123,12 @@ impl ElectrumChainSource {
 				Error::WalletOperationFailed
 			})?;
 		}
+		let sync_guard =
+			WalletSyncGuard::new(&self.onchain_wallet_sync_status, Error::WalletOperationFailed);
 
 		let res = self.sync_onchain_wallet_inner(onchain_wallet).await;
 
-		self.onchain_wallet_sync_status.lock().expect("lock").propagate_result_to_subscribers(res);
+		sync_guard.complete(res);
 
 		res
 	}
@@ -180,7 +194,7 @@ impl ElectrumChainSource {
 		update_res: Result<BdkUpdate, Error>, now: Instant,
 	) -> Result<(), Error> {
 		match update_res {
-			Ok(update) => match onchain_wallet.apply_update(update) {
+			Ok(update) => match onchain_wallet.apply_update(update).await {
 				Ok(()) => {
 					log_debug!(
 						self.logger,
@@ -221,14 +235,13 @@ impl ElectrumChainSource {
 				Error::TxSyncFailed
 			})?;
 		}
+		let sync_guard =
+			WalletSyncGuard::new(&self.lightning_wallet_sync_status, Error::TxSyncFailed);
 
 		let res =
 			self.sync_lightning_wallet_inner(channel_manager, chain_monitor, output_sweeper).await;
 
-		self.lightning_wallet_sync_status
-			.lock()
-			.expect("lock")
-			.propagate_result_to_subscribers(res);
+		sync_guard.complete(res);
 
 		res
 	}
@@ -240,7 +253,7 @@ impl ElectrumChainSource {
 		let sync_cman = Arc::clone(&channel_manager);
 		let sync_cmon = Arc::clone(&chain_monitor);
 		let sync_sweeper = Arc::clone(&output_sweeper);
-		let confirmables = vec![
+		let confirmables: Vec<Arc<dyn Confirm + Sync + Send>> = vec![
 			sync_cman as Arc<dyn Confirm + Sync + Send>,
 			sync_cmon as Arc<dyn Confirm + Sync + Send>,
 			sync_sweeper as Arc<dyn Confirm + Sync + Send>,
@@ -258,7 +271,8 @@ impl ElectrumChainSource {
 			return Err(Error::TxSyncFailed);
 		};
 
-		let res = electrum_client.sync_confirmables(confirmables).await;
+		let confirmable = electrum_client.wrap_confirmables(&confirmables);
+		let res = electrum_client.sync_confirmables(vec![confirmable]).await;
 
 		if let Ok(_) = res {
 			let unix_time_secs_opt =
@@ -306,7 +320,54 @@ impl ElectrumChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+	pub(crate) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+			self.electrum_runtime_status.read().expect("lock").client().as_ref()
+		{
+			Arc::clone(client)
+		} else {
+			debug_assert!(
+				false,
+				"We should have started the chain source before checking submitpackage support"
+			);
+			return Err(Error::ConnectionFailed);
+		};
+
+		// TODO: Use `protocol_version` API once shipped in
+		// https://github.com/bitcoindevkit/rust-electrum-client/pull/213.
+		//
+		// This could still accept an Electrum server running against Bitcoin Core v26
+		// through v28, which does not relay ephemeral dust.
+		let spawn_fut = electrum_client.runtime.spawn_blocking({
+			let electrum_client = Arc::clone(&electrum_client.electrum_client);
+			move || electrum_client.transaction_broadcast_package(&super::dummy_package())
+		});
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
+			spawn_fut,
+		);
+
+		match timeout_fut.await {
+			Ok(Ok(Ok(_))) => Ok(()),
+			Ok(Ok(Err(
+				e @ (electrum_client::Error::Protocol(_)
+				| electrum_client::Error::AllAttemptsErrored(_)),
+			))) => {
+				log_error!(self.logger, "Electrum server does not support submitpackage: {:?}", e);
+				Err(Error::ChainSourceNotSupported)
+			},
+			e => {
+				log_error!(
+					self.logger,
+					"Failed to check support for submitpackage on the Electrum server: {:?}",
+					e
+				);
+				Err(Error::ConnectionFailed)
+			},
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
 		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
 			self.electrum_runtime_status.read().expect("lock").client().as_ref()
 		{
@@ -316,8 +377,14 @@ impl ElectrumChainSource {
 			return;
 		};
 
-		for tx in package {
-			electrum_client.broadcast(tx).await;
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => electrum_client.submit_package(txs).await,
+			_ => {
+				for tx in txs.into_inner() {
+					electrum_client.broadcast(tx).await
+				}
+			},
 		}
 	}
 }
@@ -331,79 +398,78 @@ impl Filter for ElectrumChainSource {
 	}
 }
 
-enum ElectrumRuntimeStatus {
-	Started(Arc<ElectrumRuntimeClient>),
-	Stopped {
-		pending_registered_txs: Vec<(Txid, ScriptBuf)>,
-		pending_registered_outputs: Vec<WatchedOutput>,
-	},
+struct ElectrumRuntimeStatus {
+	client: Option<Arc<ElectrumRuntimeClient>>,
+	// The canonical inventory of all `Filter` entries registered over this chain source's
+	// lifetime.
+	//
+	// We retain these even while started: the `ElectrumRuntimeClient` (and hence the
+	// `ElectrumSyncClient` owning its own copy of the registrations) is dropped on `stop`, so
+	// replaying the inventory on the next `start` is the only way to keep watching the same set
+	// of transactions and outputs across a `stop`/`start` cycle. Note that we can't simply
+	// re-register from `ChannelMonitor::load_outputs_to_watch` instead, as, e.g., the
+	// `OutputSweeper` also registers outputs it wants to see spent.
+	registered_txs: HashMap<Txid, ScriptBuf>,
+	registered_outputs: HashSet<WatchedOutput>,
 }
 
 impl ElectrumRuntimeStatus {
 	fn new() -> Self {
-		let pending_registered_txs = Vec::new();
-		let pending_registered_outputs = Vec::new();
-		Self::Stopped { pending_registered_txs, pending_registered_outputs }
+		let client = None;
+		let registered_txs = HashMap::new();
+		let registered_outputs = HashSet::new();
+		Self { client, registered_txs, registered_outputs }
 	}
 
 	pub(super) fn start(
 		&mut self, server_url: String, sync_config: ElectrumSyncConfig, runtime: Arc<Runtime>,
 		config: Arc<Config>, logger: Arc<Logger>,
 	) -> Result<(), Error> {
-		match self {
-			Self::Stopped { pending_registered_txs, pending_registered_outputs } => {
-				let client = Arc::new(ElectrumRuntimeClient::new(
-					server_url,
-					sync_config,
-					runtime,
-					config,
-					logger,
-				)?);
-
-				// Apply any pending `Filter` entries
-				for (txid, script_pubkey) in pending_registered_txs.drain(..) {
-					client.register_tx(&txid, &script_pubkey);
-				}
-
-				for output in pending_registered_outputs.drain(..) {
-					client.register_output(output)
-				}
-
-				*self = Self::Started(client);
-			},
-			Self::Started(_) => {
-				debug_assert!(false, "We shouldn't call start if we're already started")
-			},
+		if self.client.is_some() {
+			debug_assert!(false, "We shouldn't call start if we're already started");
+			return Ok(());
 		}
+
+		let client =
+			Arc::new(ElectrumRuntimeClient::new(server_url, sync_config, runtime, config, logger)?);
+
+		// (Re-)apply all known `Filter` entries to the fresh client.
+		for (txid, script_pubkey) in self.registered_txs.iter() {
+			client.register_tx(txid, script_pubkey);
+		}
+
+		for output in self.registered_outputs.iter() {
+			client.register_output(output.clone());
+		}
+
+		self.client = Some(client);
+
 		Ok(())
 	}
 
-	pub(super) fn stop(&mut self) {
-		*self = Self::new()
+	pub(super) fn stop(&mut self) -> Option<Arc<ElectrumRuntimeClient>> {
+		// Drop the client, but retain the registration inventory so we can replay it if we're
+		// started again.
+		self.client.take()
 	}
 
 	fn client(&self) -> Option<Arc<ElectrumRuntimeClient>> {
-		match self {
-			Self::Started(client) => Some(Arc::clone(&client)),
-			Self::Stopped { .. } => None,
-		}
+		self.client.as_ref().map(Arc::clone)
 	}
 
 	fn register_tx(&mut self, txid: &Txid, script_pubkey: &Script) {
-		match self {
-			Self::Started(client) => client.register_tx(txid, script_pubkey),
-			Self::Stopped { pending_registered_txs, .. } => {
-				pending_registered_txs.push((*txid, script_pubkey.to_owned()))
-			},
+		self.registered_txs.insert(*txid, script_pubkey.to_owned());
+
+		if let Some(client) = self.client.as_ref() {
+			client.register_tx(txid, script_pubkey);
 		}
 	}
 
 	fn register_output(&mut self, output: lightning::chain::WatchedOutput) {
-		match self {
-			Self::Started(client) => client.register_output(output),
-			Self::Stopped { pending_registered_outputs, .. } => {
-				pending_registered_outputs.push(output)
-			},
+		self.registered_outputs.insert(output.clone());
+
+		if let Some(client) = self.client.as_ref() {
+			client.register_output(output);
 		}
 	}
 }
@@ -416,6 +482,7 @@ struct ElectrumRuntimeClient {
 	runtime: Arc<Runtime>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
+	confirm_gate: Arc<ConfirmGate>,
 }
 
 impl ElectrumRuntimeClient {
@@ -452,7 +519,21 @@ impl ElectrumRuntimeClient {
 			runtime,
 			config,
 			logger,
+			confirm_gate: Arc::new(ConfirmGate::new()),
 		})
+	}
+
+	fn begin_shutdown(&self) {
+		self.confirm_gate.deactivate();
+	}
+
+	fn wrap_confirmables(
+		&self, confirmables: &[Arc<dyn Confirm + Sync + Send>],
+	) -> Arc<dyn Confirm + Sync + Send> {
+		Arc::new(ShutdownAwareConfirm::new(
+			Arc::downgrade(&self.confirm_gate),
+			confirmables.iter().map(Arc::downgrade).collect(),
+		))
 	}
 
 	async fn sync_confirmables(
@@ -483,6 +564,10 @@ impl ElectrumRuntimeClient {
 				log_error!(self.logger, "Sync of Lightning wallet failed: {}", e);
 				Error::TxSyncFailed
 			})?;
+
+		if !self.confirm_gate.is_active() {
+			return Err(Error::TxSyncFailed);
+		}
 
 		log_debug!(
 			self.logger,
@@ -577,14 +662,24 @@ impl ElectrumRuntimeClient {
 			})
 	}
 
+	fn log_broadcast_error(&self, e: impl core::fmt::Display, txids: &[Txid], txs: &[Transaction]) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
 	async fn broadcast(&self, tx: Transaction) {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let txid = tx.compute_txid();
-		let tx_bytes = tx.encode();
+		let tx = Arc::new(tx);
 
-		let spawn_fut =
-			self.runtime.spawn_blocking(move || electrum_client.transaction_broadcast(&tx));
+		let spawn_fut = self.runtime.spawn_blocking({
+			let tx = Arc::clone(&tx);
+			move || electrum_client.transaction_broadcast(tx.as_ref())
+		});
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
 			spawn_fut,
@@ -592,31 +687,55 @@ impl ElectrumRuntimeClient {
 
 		match timeout_fut.await {
 			Ok(res) => match res {
-				Ok(_) => {
+				Ok(Ok(txid)) => {
 					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
 				},
-				Err(e) => {
-					log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
-					log_trace!(
-						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx_bytes)
-					);
+				Ok(Err(e)) => {
+					self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref()))
 				},
+				Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
 			},
-			Err(e) => {
-				log_error!(
-					self.logger,
-					"Failed to broadcast transaction due to timeout {}: {}",
-					txid,
-					e
-				);
-				log_trace!(
-					self.logger,
-					"Failed broadcast transaction bytes: {}",
-					log_bytes!(tx_bytes)
-				);
+			Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
+		}
+	}
+
+	async fn submit_package(&self, package: SortedTransactions) {
+		let electrum_client = Arc::clone(&self.electrum_client);
+
+		let txids: Vec<_> = package.iter().map(|tx| tx.compute_txid()).collect();
+		let package = Arc::new(package);
+
+		let spawn_fut = self.runtime.spawn_blocking({
+			let package = Arc::clone(&package);
+			move || electrum_client.transaction_broadcast_package(&package)
+		});
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
+			spawn_fut,
+		);
+
+		match timeout_fut.await {
+			Ok(res) => match res {
+				Ok(Ok(result)) => {
+					if result.success {
+						log_trace!(
+							self.logger,
+							"Successfully broadcast transaction(s) {:?}",
+							txids
+						);
+						log_trace!(
+							self.logger,
+							"Successfully broadcast transaction(s) {:?}",
+							result
+						);
+					} else {
+						self.log_broadcast_error(format!("{:?}", result), &txids, &package);
+					}
+				},
+				Ok(Err(e)) => self.log_broadcast_error(e, &txids, &package),
+				Err(e) => self.log_broadcast_error(e, &txids, &package),
 			},
+			Err(e) => self.log_broadcast_error(e, &txids, &package),
 		}
 	}
 
@@ -706,11 +825,232 @@ impl ElectrumRuntimeClient {
 	}
 }
 
+struct ConfirmGate {
+	active: Mutex<bool>,
+}
+
+impl ConfirmGate {
+	fn new() -> Self {
+		Self { active: Mutex::new(true) }
+	}
+
+	fn deactivate(&self) {
+		*self.active.lock().expect("lock") = false;
+	}
+
+	fn is_active(&self) -> bool {
+		*self.active.lock().expect("lock")
+	}
+}
+
+struct ShutdownAwareConfirm {
+	gate: Weak<ConfirmGate>,
+	confirmables: Vec<Weak<dyn Confirm + Sync + Send>>,
+}
+
+impl ShutdownAwareConfirm {
+	fn new(gate: Weak<ConfirmGate>, confirmables: Vec<Weak<dyn Confirm + Sync + Send>>) -> Self {
+		Self { gate, confirmables }
+	}
+
+	fn with_confirmables<T>(
+		&self, inactive_result: T, f: impl FnOnce(&[Arc<dyn Confirm + Sync + Send>]) -> T,
+	) -> T {
+		let Some(gate) = self.gate.upgrade() else {
+			return inactive_result;
+		};
+		let active = gate.active.lock().expect("lock");
+		if !*active {
+			return inactive_result;
+		}
+
+		let Some(confirmables): Option<Vec<Arc<dyn Confirm + Sync + Send>>> =
+			self.confirmables.iter().map(Weak::upgrade).collect()
+		else {
+			return inactive_result;
+		};
+		f(&confirmables)
+	}
+}
+
+impl Confirm for ShutdownAwareConfirm {
+	fn transactions_confirmed(
+		&self, header: &bitcoin::block::Header,
+		txdata: &lightning::chain::transaction::TransactionData<'_>, height: u32,
+	) {
+		self.with_confirmables((), |confirmables| {
+			for confirmable in confirmables {
+				confirmable.transactions_confirmed(header, txdata, height);
+			}
+		})
+	}
+
+	fn transaction_unconfirmed(&self, txid: &Txid) {
+		self.with_confirmables((), |confirmables| {
+			for confirmable in confirmables {
+				confirmable.transaction_unconfirmed(txid);
+			}
+		})
+	}
+
+	fn best_block_updated(&self, header: &bitcoin::block::Header, height: u32) {
+		self.with_confirmables((), |confirmables| {
+			for confirmable in confirmables {
+				confirmable.best_block_updated(header, height);
+			}
+		})
+	}
+
+	fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<bitcoin::BlockHash>)> {
+		self.with_confirmables(Vec::new(), |confirmables| {
+			confirmables.iter().flat_map(|confirmable| confirmable.get_relevant_txids()).collect()
+		})
+	}
+}
+
 impl Filter for ElectrumRuntimeClient {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
 		self.tx_sync.register_tx(txid, script_pubkey)
 	}
 	fn register_output(&self, output: WatchedOutput) {
 		self.tx_sync.register_output(output)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::mpsc;
+	use std::thread;
+
+	use bitcoin::blockdata::constants::genesis_block;
+
+	use super::*;
+
+	struct RecordingConfirm {
+		calls: AtomicUsize,
+		relevant_txid: Txid,
+	}
+
+	impl RecordingConfirm {
+		fn new(relevant_txid: Txid) -> Self {
+			Self { calls: AtomicUsize::new(0), relevant_txid }
+		}
+	}
+
+	impl Confirm for RecordingConfirm {
+		fn transactions_confirmed(
+			&self, _header: &bitcoin::block::Header,
+			_txdata: &lightning::chain::transaction::TransactionData<'_>, _height: u32,
+		) {
+			self.calls.fetch_add(1, Ordering::AcqRel);
+		}
+
+		fn transaction_unconfirmed(&self, _txid: &Txid) {
+			self.calls.fetch_add(1, Ordering::AcqRel);
+		}
+
+		fn best_block_updated(&self, _header: &bitcoin::block::Header, _height: u32) {
+			self.calls.fetch_add(1, Ordering::AcqRel);
+		}
+
+		fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<bitcoin::BlockHash>)> {
+			vec![(self.relevant_txid, 0, None)]
+		}
+	}
+
+	struct BlockingConfirm {
+		calls: AtomicUsize,
+		started: Mutex<Option<mpsc::SyncSender<()>>>,
+		release: Mutex<mpsc::Receiver<()>>,
+	}
+
+	impl Confirm for BlockingConfirm {
+		fn transactions_confirmed(
+			&self, _header: &bitcoin::block::Header,
+			_txdata: &lightning::chain::transaction::TransactionData<'_>, _height: u32,
+		) {
+		}
+
+		fn transaction_unconfirmed(&self, _txid: &Txid) {}
+
+		fn best_block_updated(&self, _header: &bitcoin::block::Header, _height: u32) {
+			self.calls.fetch_add(1, Ordering::AcqRel);
+			if let Some(started) = self.started.lock().expect("lock").take() {
+				started.send(()).expect("test should still be waiting");
+			}
+			self.release.lock().expect("lock").recv().expect("test should release callback");
+		}
+
+		fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<bitcoin::BlockHash>)> {
+			Vec::new()
+		}
+	}
+
+	#[test]
+	fn confirm_callbacks_are_ignored_after_shutdown() {
+		let block = genesis_block(Network::Regtest);
+		let txid = block.txdata[0].compute_txid();
+		let delegate = Arc::new(RecordingConfirm::new(txid));
+		let delegate_dyn: Arc<dyn Confirm + Sync + Send> = delegate.clone();
+		let gate = Arc::new(ConfirmGate::new());
+		let confirm =
+			ShutdownAwareConfirm::new(Arc::downgrade(&gate), vec![Arc::downgrade(&delegate_dyn)]);
+
+		confirm.best_block_updated(&block.header, 0);
+		assert_eq!(delegate.calls.load(Ordering::Acquire), 1);
+		assert_eq!(confirm.get_relevant_txids(), vec![(txid, 0, None)]);
+
+		gate.deactivate();
+		confirm.transactions_confirmed(&block.header, &[], 0);
+		confirm.transaction_unconfirmed(&txid);
+		confirm.best_block_updated(&block.header, 0);
+		assert_eq!(delegate.calls.load(Ordering::Acquire), 1);
+		assert!(confirm.get_relevant_txids().is_empty());
+	}
+
+	#[test]
+	fn shutdown_waits_for_the_whole_confirm_callback() {
+		let block = genesis_block(Network::Regtest);
+		let txid = block.txdata[0].compute_txid();
+		let (started_sender, started_receiver) = mpsc::sync_channel(1);
+		let (release_sender, release_receiver) = mpsc::sync_channel(1);
+		let blocking = Arc::new(BlockingConfirm {
+			calls: AtomicUsize::new(0),
+			started: Mutex::new(Some(started_sender)),
+			release: Mutex::new(release_receiver),
+		});
+		let trailing = Arc::new(RecordingConfirm::new(txid));
+		let blocking_dyn: Arc<dyn Confirm + Sync + Send> = blocking.clone();
+		let trailing_dyn: Arc<dyn Confirm + Sync + Send> = trailing.clone();
+		let gate = Arc::new(ConfirmGate::new());
+		let confirm = Arc::new(ShutdownAwareConfirm::new(
+			Arc::downgrade(&gate),
+			vec![Arc::downgrade(&blocking_dyn), Arc::downgrade(&trailing_dyn)],
+		));
+
+		let callback = {
+			let confirm = Arc::clone(&confirm);
+			thread::spawn(move || confirm.best_block_updated(&block.header, 0))
+		};
+		started_receiver.recv().expect("callback should start");
+
+		let (shutdown_done_sender, shutdown_done_receiver) = mpsc::sync_channel(1);
+		let shutdown = thread::spawn(move || {
+			gate.deactivate();
+			shutdown_done_sender.send(()).expect("test should still be waiting");
+		});
+		assert!(shutdown_done_receiver.recv_timeout(Duration::from_millis(50)).is_err());
+
+		release_sender.send(()).expect("callback should still be running");
+		callback.join().expect("callback should finish");
+		shutdown_done_receiver.recv().expect("shutdown should finish");
+		shutdown.join().expect("shutdown should not panic");
+
+		assert_eq!(blocking.calls.load(Ordering::Acquire), 1);
+		assert_eq!(trailing.calls.load(Ordering::Acquire), 1);
+		confirm.best_block_updated(&block.header, 0);
+		assert_eq!(blocking.calls.load(Ordering::Acquire), 1);
+		assert_eq!(trailing.calls.load(Ordering::Acquire), 1);
 	}
 }

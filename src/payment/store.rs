@@ -25,6 +25,39 @@ use lightning_types::string::UntrustedString;
 use crate::data_store::{StorableObject, StorableObjectId, StorableObjectUpdate};
 use crate::hex_utils;
 
+/// An opaque token used to continue a paginated listing.
+///
+/// See [`Node::list_payments`] for how to use it.
+///
+/// [`Node::list_payments`]: crate::Node::list_payments
+#[cfg(not(feature = "uniffi"))]
+pub type PageToken = lightning::util::persist::PageToken;
+/// An opaque token used to continue a paginated listing.
+///
+/// See [`Node::list_payments`] for how to use it.
+///
+/// [`Node::list_payments`]: crate::Node::list_payments
+#[cfg(feature = "uniffi")]
+pub type PageToken = std::sync::Arc<crate::ffi::PageToken>;
+
+/// A page of payments, as returned by [`Node::list_payments`].
+///
+/// [`Node::list_payments`]: crate::Node::list_payments
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PaymentDetailsPage {
+	/// The payments in this page, ordered from most recently created to least recently created.
+	///
+	/// Note this may hold fewer payments than the storage backend's page size even when further
+	/// pages remain, so iterate until `next_page_token` is `None` rather than until a short page.
+	pub payments: Vec<PaymentDetails>,
+	/// The token to pass to the next [`Node::list_payments`] call, or `None` if this was the last
+	/// page.
+	///
+	/// [`Node::list_payments`]: crate::Node::list_payments
+	pub next_page_token: Option<PageToken>,
+}
+
 /// Represents a payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -152,6 +185,10 @@ impl StorableObjectId for PaymentId {
 	fn encode_to_hex_str(&self) -> String {
 		hex_utils::to_string(&self.0)
 	}
+
+	fn decode_from_hex_str(s: &str) -> Option<Self> {
+		hex_utils::to_vec(s)?.try_into().ok().map(PaymentId)
+	}
 }
 impl StorableObject for PaymentDetails {
 	type Id = PaymentId;
@@ -243,12 +280,28 @@ impl StorableObject for PaymentDetails {
 			}
 		}
 
-		if let Some(amount_opt) = update.amount_msat {
-			update_if_necessary!(self.amount_msat, amount_opt);
-		}
+		// Once an on-chain record is confirmed, its txid and figures describe the candidate that
+		// confirmed, which need not be the last one broadcast. An update that doesn't assert the
+		// confirmation state was built without knowing it — e.g. a late funding classification
+		// whose candidate lost to the counterparty's broadcast — so it must not move them. The
+		// exception is an update naming the confirmed txid itself: its figures describe the very
+		// candidate that confirmed and correct the wallet-view amount/fee a sync-created record
+		// carries, which cannot represent our contribution to a shared funding output.
+		let keep_confirmed_figures = update.confirmation_status.is_none()
+			&& matches!(
+				self.kind,
+				PaymentKind::Onchain { txid, status: ConfirmationStatus::Confirmed { .. }, .. }
+					if update.txid != Some(txid)
+			);
 
-		if let Some(fee_paid_msat_opt) = update.fee_paid_msat {
-			update_if_necessary!(self.fee_paid_msat, fee_paid_msat_opt);
+		if !keep_confirmed_figures {
+			if let Some(amount_opt) = update.amount_msat {
+				update_if_necessary!(self.amount_msat, amount_opt);
+			}
+
+			if let Some(fee_paid_msat_opt) = update.fee_paid_msat {
+				update_if_necessary!(self.fee_paid_msat, fee_paid_msat_opt);
+			}
 		}
 
 		if let Some(skimmed_fee_msat) = update.counterparty_skimmed_fee_msat {
@@ -278,7 +331,7 @@ impl StorableObject for PaymentDetails {
 
 		if let Some(tx_id) = update.txid {
 			match self.kind {
-				PaymentKind::Onchain { ref mut txid, .. } => {
+				PaymentKind::Onchain { ref mut txid, .. } if !keep_confirmed_figures => {
 					update_if_necessary!(*txid, tx_id);
 				},
 				_ => {},
@@ -288,7 +341,9 @@ impl StorableObject for PaymentDetails {
 		if let Some(tx_type_update) = update.tx_type {
 			match self.kind {
 				PaymentKind::Onchain { ref mut tx_type, .. } => {
-					update_if_necessary!(*tx_type, tx_type_update);
+					if tx_type.is_none() || tx_type_update.is_some() {
+						update_if_necessary!(*tx_type, tx_type_update);
+					}
 				},
 				_ => {},
 			}
@@ -562,6 +617,9 @@ pub enum PaymentKind {
 	///
 	/// [BOLT 12]: https://github.com/lightning/bolts/blob/master/12-offer-encoding.md
 	/// [`Refund`]: lightning::offers::refund::Refund
+	// TODO: Start setting `payer_note` and `quantity` for inbound refund payments again once
+	// LDK v0.4 exposes refund context via `PaymentClaimable`.
+	// See https://github.com/lightningdevkit/ldk-node/issues/1023.
 	Bolt12Refund {
 		/// The payment hash, i.e., the hash of the `preimage`.
 		hash: Option<PaymentHash>,
@@ -571,9 +629,13 @@ pub enum PaymentKind {
 		secret: Option<PaymentSecret>,
 		/// The payer note for the refund payment.
 		///
+		/// Currently only set for outbound refund payments.
+		///
 		/// This will always be `None` for payments serialized with version `v0.3.0`.
 		payer_note: Option<UntrustedString>,
 		/// The quantity of an item that the refund is for.
+		///
+		/// Currently only set for outbound refund payments.
 		///
 		/// This will always be `None` for payments serialized with version `v0.3.0`.
 		quantity: Option<u64>,
@@ -709,6 +771,33 @@ impl PaymentDetailsUpdate {
 			txid: None,
 			tx_type: None,
 		}
+	}
+
+	/// Builds an update that merges a freshly-classified funding payment's classification
+	/// (`tx_type`), broadcast txid, and our contribution figures (amount/fee) into an existing
+	/// record, while leaving the top-level [`PaymentStatus`] and the on-chain
+	/// [`ConfirmationStatus`] untouched.
+	///
+	/// Funding classification runs off the broadcaster queue and can land *after* wallet sync has
+	/// already advanced a record's confirmation state (e.g. when the counterparty's broadcast of
+	/// the funding transaction is observed first). Merging only the funding-specific fields keeps
+	/// such a late classification from downgrading a `Confirmed`/`Succeeded` payment back to
+	/// `Unconfirmed`/`Pending`; the confirmation state is owned by the wallet-sync events instead.
+	///
+	/// The txid and figures are taken from the freshly broadcast (active) candidate, so they only
+	/// apply while the record is unconfirmed. Once a candidate confirms, the record's txid and
+	/// figures describe that candidate — which need not be the one being classified (e.g. the
+	/// counterparty broadcast an earlier candidate and it won) — and [`PaymentDetails::update`]
+	/// leaves them in place for updates like this one that don't carry a confirmation state.
+	pub(crate) fn funding_reclassification(details: PaymentDetails) -> Self {
+		let mut update = Self::new(details.id);
+		update.amount_msat = Some(details.amount_msat);
+		update.fee_paid_msat = Some(details.fee_paid_msat);
+		if let PaymentKind::Onchain { txid, tx_type, .. } = details.kind {
+			update.txid = Some(txid);
+			update.tx_type = Some(tx_type);
+		}
+		update
 	}
 }
 
@@ -883,8 +972,9 @@ mod tests {
 
 	#[test]
 	fn onchain_tx_type_deser_compat() {
-		use bitcoin::hashes::Hash;
 		use std::str::FromStr;
+
+		use bitcoin::hashes::Hash;
 
 		let txid = Txid::from_byte_array([7u8; 32]);
 		let status = ConfirmationStatus::Unconfirmed;
@@ -919,6 +1009,473 @@ mod tests {
 			}),
 		};
 		assert_eq!(kind, PaymentKind::read(&mut &*kind.encode()).unwrap());
+	}
+
+	#[test]
+	fn known_onchain_tx_type_survives_unknown_update() {
+		use std::str::FromStr;
+
+		use bitcoin::hashes::Hash;
+
+		let txid = Txid::from_byte_array([8u8; 32]);
+		let payment_id = PaymentId(txid.to_byte_array());
+		let pubkey = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let tx_type = TransactionType::CooperativeClose {
+			counterparty_node_id: pubkey,
+			channel_id: ChannelId([4u8; 32]),
+		};
+		let mut classified = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: Some(tx_type.clone()),
+			},
+			Some(1_000),
+			Some(100),
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		let wallet_sync_update = PaymentDetails::new(
+			payment_id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash: BlockHash::from_byte_array([9u8; 32]),
+					height: 42,
+					timestamp: 123,
+				},
+				tx_type: None,
+			},
+			Some(1_000),
+			Some(100),
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+
+		assert!(classified.update(PaymentDetailsUpdate::from(&wallet_sync_update)));
+		match classified.kind {
+			PaymentKind::Onchain { status, tx_type: Some(updated_tx_type), .. } => {
+				assert!(matches!(status, ConfirmationStatus::Confirmed { height: 42, .. }));
+				assert_eq!(updated_tx_type, tx_type);
+			},
+			other => panic!("Unexpected payment kind: {:?}", other),
+		}
+	}
+
+	#[test]
+	fn transaction_type_from_ldk_variants() {
+		use std::str::FromStr;
+
+		let pubkey = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let channel_id = ChannelId([5u8; 32]);
+		let channel = Channel { counterparty_node_id: pubkey, channel_id };
+
+		let variants = vec![
+			(
+				LdkTransactionType::Funding { channels: vec![(pubkey, channel_id)] },
+				TransactionType::Funding { channels: vec![channel.clone()] },
+			),
+			(
+				LdkTransactionType::CooperativeClose { counterparty_node_id: pubkey, channel_id },
+				TransactionType::CooperativeClose { counterparty_node_id: pubkey, channel_id },
+			),
+			(
+				LdkTransactionType::UnilateralClose { counterparty_node_id: pubkey, channel_id },
+				TransactionType::UnilateralClose { counterparty_node_id: pubkey, channel_id },
+			),
+			(
+				LdkTransactionType::AnchorBump { counterparty_node_id: pubkey, channel_id },
+				TransactionType::AnchorBump { counterparty_node_id: pubkey, channel_id },
+			),
+			(
+				LdkTransactionType::Claim { counterparty_node_id: pubkey, channel_id },
+				TransactionType::Claim { counterparty_node_id: pubkey, channel_id },
+			),
+			(
+				LdkTransactionType::Sweep { channels: vec![(pubkey, channel_id)] },
+				TransactionType::Sweep { channels: vec![channel] },
+			),
+		];
+
+		for (ldk_type, expected_type) in variants {
+			assert_eq!(TransactionType::from(ldk_type), expected_type);
+		}
+	}
+
+	#[test]
+	fn funding_reclassification_does_not_downgrade_an_advanced_record() {
+		use std::str::FromStr;
+
+		use bitcoin::hashes::Hash;
+
+		// A splice funding payment wallet sync has already advanced to Succeeded/Confirmed.
+		let txid = Txid::from_byte_array([7u8; 32]);
+		let id = PaymentId(txid.to_byte_array());
+		let tx_type = Some(TransactionType::InteractiveFunding {
+			channels: vec![Channel {
+				counterparty_node_id: PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+				)
+				.unwrap(),
+				channel_id: ChannelId([3u8; 32]),
+			}],
+		});
+		let advanced = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash: BlockHash::from_byte_array([8u8; 32]),
+					height: 100,
+					timestamp: 1,
+				},
+				tx_type: tx_type.clone(),
+			},
+			Some(2_000_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Succeeded,
+		);
+
+		// A fresh funding classification for the same payment is always Pending/Unconfirmed.
+		let fresh = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain { txid, status: ConfirmationStatus::Unconfirmed, tx_type },
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		// The naive full update `insert_or_update` applied before the fix downgrades both the
+		// top-level status and the on-chain confirmation status — the bug Codex flagged.
+		let mut downgraded = advanced.clone();
+		downgraded.update((&fresh).into());
+		assert_eq!(
+			downgraded.status,
+			PaymentStatus::Pending,
+			"a full update from a fresh classification downgrades the top-level status",
+		);
+		assert!(
+			matches!(
+				downgraded.kind,
+				PaymentKind::Onchain { status: ConfirmationStatus::Unconfirmed, .. }
+			),
+			"a full update from a fresh classification downgrades the confirmation status",
+		);
+
+		// The narrowed reclassification update merges only the funding fields and preserves the
+		// advanced confirmation state that wallet sync owns.
+		let mut merged = advanced.clone();
+		merged.update(PaymentDetailsUpdate::funding_reclassification(fresh));
+		assert_eq!(
+			merged.status,
+			PaymentStatus::Succeeded,
+			"reclassification must not downgrade the top-level status",
+		);
+		assert!(
+			matches!(
+				merged.kind,
+				PaymentKind::Onchain {
+					status: ConfirmationStatus::Confirmed { .. },
+					tx_type: Some(TransactionType::InteractiveFunding { .. }),
+					..
+				}
+			),
+			"reclassification must preserve the confirmation status and keep the funding tx_type",
+		);
+		// The late classification names the confirmed txid, so its contribution-derived figures
+		// replace the record's; only an update for a different candidate leaves them in place
+		// (covered by `funding_reclassification_keeps_confirmed_candidate_figures`).
+		assert_eq!(merged.amount_msat, Some(1_000_000));
+		assert_eq!(merged.fee_paid_msat, Some(500));
+	}
+
+	#[test]
+	fn funding_reclassification_keeps_confirmed_candidate_figures() {
+		use std::str::FromStr;
+
+		use bitcoin::hashes::Hash;
+
+		// A funding payment whose first candidate wallet sync has already seen confirm — e.g. the
+		// counterparty's broadcast of it was picked up before our own later candidate was
+		// classified. The record is unclassified (created by the sync fallthrough).
+		let confirmed_txid = Txid::from_byte_array([7u8; 32]);
+		let id = PaymentId(confirmed_txid.to_byte_array());
+		let confirmed = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid: confirmed_txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash: BlockHash::from_byte_array([8u8; 32]),
+					height: 100,
+					timestamp: 1,
+				},
+				tx_type: None,
+			},
+			Some(2_000_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		// Our own, different (e.g. fee-bumped) candidate is classified late.
+		let late_txid = Txid::from_byte_array([9u8; 32]);
+		let tx_type = Some(TransactionType::InteractiveFunding {
+			channels: vec![Channel {
+				counterparty_node_id: PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+				)
+				.unwrap(),
+				channel_id: ChannelId([3u8; 32]),
+			}],
+		});
+		let late = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid: late_txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type,
+			},
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		// The confirmed record's txid and figures describe the candidate that confirmed; the late
+		// classification must not replace them with an unconfirmed candidate's. The
+		// classification itself (`tx_type`) still lands.
+		let mut classified = confirmed.clone();
+		classified.update(PaymentDetailsUpdate::funding_reclassification(late.clone()));
+		assert!(
+			matches!(
+				classified.kind,
+				PaymentKind::Onchain {
+					txid,
+					tx_type: Some(TransactionType::InteractiveFunding { .. }),
+					..
+				} if txid == confirmed_txid
+			),
+			"a late classification must set the tx_type but not replace a confirmed record's txid",
+		);
+		assert_eq!(classified.amount_msat, Some(2_000_000));
+		assert_eq!(classified.fee_paid_msat, Some(999));
+
+		// While the record is still unconfirmed, the freshly broadcast candidate is the active
+		// one, so its txid and figures do replace the stored ones (RBF rotation).
+		let mut unconfirmed = confirmed.clone();
+		if let PaymentKind::Onchain { ref mut status, .. } = unconfirmed.kind {
+			*status = ConfirmationStatus::Unconfirmed;
+		}
+		unconfirmed.update(PaymentDetailsUpdate::funding_reclassification(late));
+		assert!(
+			matches!(unconfirmed.kind, PaymentKind::Onchain { txid, .. } if txid == late_txid),
+			"classifying a new candidate of an unconfirmed record rotates the txid",
+		);
+		assert_eq!(unconfirmed.amount_msat, Some(1_000_000));
+		assert_eq!(unconfirmed.fee_paid_msat, Some(500));
+	}
+
+	#[test]
+	fn funding_reclassification_merges_figures_for_the_confirmed_candidate() {
+		use std::str::FromStr;
+
+		use bitcoin::hashes::Hash;
+
+		// Wallet sync confirmed the transaction before classification ran, so the record carries
+		// the wallet's own view of amount/fee, which cannot represent our contribution to a shared
+		// funding output.
+		let confirmed_txid = Txid::from_byte_array([7u8; 32]);
+		let id = PaymentId(confirmed_txid.to_byte_array());
+		let mut record = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid: confirmed_txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash: BlockHash::from_byte_array([8u8; 32]),
+					height: 100,
+					timestamp: 1,
+				},
+				tx_type: None,
+			},
+			Some(2_000_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		// The late classification names the candidate that confirmed, so its contribution-derived
+		// figures are authoritative and must replace the wallet-view ones; only an update for a
+		// different (losing) candidate leaves a confirmed record's figures in place.
+		let tx_type = Some(TransactionType::InteractiveFunding {
+			channels: vec![Channel {
+				counterparty_node_id: PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+				)
+				.unwrap(),
+				channel_id: ChannelId([3u8; 32]),
+			}],
+		});
+		let classified = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid: confirmed_txid,
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type,
+			},
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		assert!(record.update(PaymentDetailsUpdate::funding_reclassification(classified)));
+		assert!(
+			matches!(
+				record.kind,
+				PaymentKind::Onchain {
+					txid,
+					status: ConfirmationStatus::Confirmed { .. },
+					tx_type: Some(TransactionType::InteractiveFunding { .. }),
+				} if txid == confirmed_txid
+			),
+			"the confirmed txid, confirmation state, and classification must all be in place",
+		);
+		assert_eq!(record.amount_msat, Some(1_000_000));
+		assert_eq!(record.fee_paid_msat, Some(500));
+	}
+
+	#[tokio::test]
+	async fn funding_classification_merge_preserves_advanced_record() {
+		use std::str::FromStr;
+		use std::sync::Arc;
+
+		use bitcoin::hashes::Hash;
+		use lightning::util::test_utils::TestLogger;
+
+		use crate::data_store::{DataStore, KeepAllEntries};
+		use crate::io::test_utils::InMemoryStore;
+		use crate::types::{DynStore, DynStoreWrapper};
+
+		let txid = Txid::from_byte_array([7u8; 32]);
+		let id = PaymentId(txid.to_byte_array());
+		let tx_type = Some(TransactionType::InteractiveFunding {
+			channels: vec![Channel {
+				counterparty_node_id: PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+				)
+				.unwrap(),
+				channel_id: ChannelId([3u8; 32]),
+			}],
+		});
+		// A funding payment wallet sync has already recorded (unclassified, via the default
+		// on-chain path) and advanced to Succeeded/Confirmed.
+		let advanced = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain {
+				txid,
+				status: ConfirmationStatus::Confirmed {
+					block_hash: BlockHash::from_byte_array([8u8; 32]),
+					height: 100,
+					timestamp: 1,
+				},
+				tx_type: None,
+			},
+			Some(2_000_000),
+			Some(999),
+			PaymentDirection::Outbound,
+			PaymentStatus::Succeeded,
+		);
+		// A fresh funding classification for the same payment is always Pending/Unconfirmed.
+		let fresh = PaymentDetails::new(
+			id,
+			PaymentKind::Onchain { txid, status: ConfirmationStatus::Unconfirmed, tx_type },
+			Some(1_000_000),
+			Some(500),
+			PaymentDirection::Outbound,
+			PaymentStatus::Pending,
+		);
+
+		let new_store = |seed: Vec<PaymentDetails>| {
+			let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+			let logger = Arc::new(TestLogger::new());
+			DataStore::<PaymentDetails, Arc<TestLogger>>::new(
+				seed,
+				KeepAllEntries,
+				"payment_test_primary".to_string(),
+				"payment_test_secondary".to_string(),
+				store,
+				logger,
+			)
+		};
+
+		// The pre-fix fresh-insert path — a full `insert_or_update` merge landing after a racing
+		// wallet sync already advanced the record — downgrades it.
+		let store = new_store(vec![advanced.clone()]);
+		store.insert_or_update(fresh.clone()).await.unwrap();
+		let downgraded = store.get(&id).await.unwrap().unwrap();
+		assert_eq!(
+			downgraded.status,
+			PaymentStatus::Pending,
+			"a full merge of a fresh classification downgrades an advanced record",
+		);
+
+		// Classification instead applies only the narrow reclassification when a record exists —
+		// no matter when it appeared — setting the `tx_type` while preserving the confirmation
+		// state wallet sync owns. The update names the confirmed txid, so its
+		// contribution-derived figures replace the record's wallet-view ones.
+		let store = new_store(vec![advanced.clone()]);
+		let update = PaymentDetailsUpdate::funding_reclassification(fresh.clone());
+		let written = store
+			.mutate(&id, |existing| match existing {
+				Some(current) => {
+					let mut updated = current.clone();
+					updated.update(update).then_some(updated)
+				},
+				None => Some(fresh.clone()),
+			})
+			.await;
+		assert!(matches!(written, Ok(Some(_))), "the reclassification must merge");
+		let merged = store.get(&id).await.unwrap().unwrap();
+		assert_eq!(merged.status, PaymentStatus::Succeeded);
+		assert!(matches!(
+			merged.kind,
+			PaymentKind::Onchain {
+				status: ConfirmationStatus::Confirmed { .. },
+				tx_type: Some(TransactionType::InteractiveFunding { .. }),
+				..
+			}
+		));
+		assert_eq!(merged.amount_msat, Some(1_000_000));
+		assert_eq!(merged.fee_paid_msat, Some(500));
+
+		// And it inserts the fresh details when no record exists yet.
+		let store = new_store(Vec::new());
+		let update = PaymentDetailsUpdate::funding_reclassification(fresh.clone());
+		let written = store
+			.mutate(&id, |existing| match existing {
+				Some(current) => {
+					let mut updated = current.clone();
+					updated.update(update).then_some(updated)
+				},
+				None => Some(fresh.clone()),
+			})
+			.await;
+		assert!(matches!(written, Ok(Some(_))), "the fresh details must insert");
+		let inserted = store.get(&id).await.unwrap().unwrap();
+		assert_eq!(inserted.status, PaymentStatus::Pending);
+		assert!(matches!(
+			inserted.kind,
+			PaymentKind::Onchain { status: ConfirmationStatus::Unconfirmed, .. }
+		));
 	}
 
 	#[derive(Clone, Debug, PartialEq, Eq)]
@@ -983,5 +1540,142 @@ mod tests {
 		let reencoded = decoded.encode();
 		assert_eq!(reencoded[0], 2);
 		assert_eq!(decoded, PaymentKind::read(&mut &*reencoded).unwrap());
+	}
+}
+
+#[cfg(test)]
+mod bounded_cache_tests {
+	use std::num::NonZeroUsize;
+	use std::sync::Arc;
+
+	use lightning::util::test_utils::TestLogger;
+
+	use super::*;
+	use crate::config::PAYMENT_CACHE_CAPACITY;
+	use crate::data_store::{DataStore, DataStoreUpdateResult, KeepLeastRecentlyUsed};
+	use crate::io::test_utils::InMemoryStore;
+	use crate::io::{
+		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
+	use crate::types::{DynStore, DynStoreWrapper};
+
+	type BoundedPaymentStore = DataStore<PaymentDetails, Arc<TestLogger>, KeepLeastRecentlyUsed>;
+
+	fn new_bounded_payment_store(capacity: usize) -> BoundedPaymentStore {
+		let kv_store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		DataStore::new(
+			Vec::new(),
+			KeepLeastRecentlyUsed::new(NonZeroUsize::new(capacity).unwrap()),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			kv_store,
+			Arc::new(TestLogger::new()),
+		)
+	}
+
+	fn bolt11_payment(seed: u8) -> PaymentDetails {
+		PaymentDetails::new(
+			PaymentId([seed; 32]),
+			PaymentKind::Bolt11 {
+				hash: PaymentHash([seed; 32]),
+				preimage: Some(PaymentPreimage([seed.wrapping_add(1); 32])),
+				secret: Some(PaymentSecret([seed.wrapping_add(2); 32])),
+				counterparty_skimmed_fee_msat: Some(seed as u64 * 7),
+			},
+			Some(seed as u64 * 1_000),
+			Some(seed as u64 * 3),
+			PaymentDirection::Outbound,
+			PaymentStatus::Succeeded,
+		)
+	}
+
+	#[tokio::test]
+	async fn evicted_payments_survive_a_round_trip_through_the_store() {
+		// A bounded store hands back objects it deserialized rather than ones it kept, so every
+		// field a payment carries has to survive being written out and read back.
+		let data_store = new_bounded_payment_store(2);
+
+		let payments: Vec<PaymentDetails> = (1..=10u8).map(bolt11_payment).collect();
+		for payment in &payments {
+			data_store.insert(payment.clone()).await.unwrap();
+		}
+		assert_eq!(2, data_store.cached_len());
+
+		for payment in &payments {
+			assert_eq!(Some(payment.clone()), data_store.get(&payment.id).await.unwrap());
+		}
+	}
+
+	#[tokio::test]
+	async fn updating_an_evicted_payment_preserves_the_fields_it_omits() {
+		// This is the failure mode a bounded cache invites: the wallet builds a partial
+		// `PaymentDetails` from a transaction and merges it in, and a payment that happens to have
+		// been evicted must not lose the fields only the merge target knows about.
+		let data_store = new_bounded_payment_store(1);
+
+		let mut stored = bolt11_payment(1);
+		stored.fee_paid_msat = Some(4_242);
+		data_store.insert(stored.clone()).await.unwrap();
+
+		// Push it out of the cache.
+		data_store.insert(bolt11_payment(2)).await.unwrap();
+
+		let mut update = PaymentDetailsUpdate::new(stored.id);
+		update.status = Some(PaymentStatus::Failed);
+		assert_eq!(Ok(DataStoreUpdateResult::Updated), data_store.update(update).await);
+
+		let updated = data_store.get(&stored.id).await.unwrap().unwrap();
+		assert_eq!(PaymentStatus::Failed, updated.status);
+		assert_eq!(Some(4_242), updated.fee_paid_msat);
+		assert_eq!(stored.kind, updated.kind);
+		assert_eq!(stored.amount_msat, updated.amount_msat);
+	}
+
+	#[tokio::test]
+	async fn listing_covers_payments_the_cache_cannot_hold() {
+		let data_store = new_bounded_payment_store(3);
+
+		let payments: Vec<PaymentDetails> = (1..=60u8).map(bolt11_payment).collect();
+		for payment in &payments {
+			data_store.insert(payment.clone()).await.unwrap();
+		}
+		assert_eq!(3, data_store.cached_len());
+
+		let mut listed = Vec::new();
+		let mut page_token = None;
+		loop {
+			let page = data_store.list_page(page_token).await.unwrap();
+			listed.extend(page.objects);
+			match page.next_page_token {
+				Some(token) => page_token = Some(token),
+				None => break,
+			}
+		}
+
+		let mut expected = payments;
+		expected.reverse();
+		assert_eq!(expected, listed);
+		// Listing the whole history must not have displaced the cache.
+		assert_eq!(3, data_store.cached_len());
+	}
+
+	#[tokio::test]
+	async fn the_cache_stays_within_its_capacity() {
+		let capacity = 16;
+		let data_store = new_bounded_payment_store(capacity);
+
+		for seed in 1..=200u8 {
+			data_store.insert(bolt11_payment(seed)).await.unwrap();
+			assert!(data_store.cached_len() <= capacity);
+		}
+		assert_eq!(capacity, data_store.cached_len());
+	}
+
+	#[test]
+	fn payment_cache_capacity_is_sane() {
+		// Small enough to bound memory at well under a megabyte, large enough to cover the recent
+		// payments a node actually works with.
+		assert!(PAYMENT_CACHE_CAPACITY.get() >= 100);
+		assert!(PAYMENT_CACHE_CAPACITY.get() <= 10_000);
 	}
 }

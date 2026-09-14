@@ -2,16 +2,91 @@ mod common;
 use std::collections::HashMap;
 
 use bitcoin::Amount;
+use electrsd::corepc_node::mtype::ChainTipsStatus;
 use ldk_node::payment::{PaymentDirection, PaymentKind};
 use ldk_node::{Event, LightningBalance, PendingSweepBalance};
 use proptest::prelude::prop;
 use proptest::proptest;
+use serde_json::json;
 
 use crate::common::{
-	expect_event, generate_blocks_and_wait, invalidate_blocks, open_channel,
-	premine_and_distribute_funds, random_chain_source, random_config, setup_bitcoind_and_electrsd,
-	setup_node, wait_for_outpoint_spend,
+	expect_event, exponential_backoff_poll, generate_blocks_and_wait, invalidate_blocks,
+	open_channel, premine_and_distribute_funds, random_chain_source, random_config,
+	setup_bitcoind_and_electrsd, setup_node, wait_for_outpoint_spend, wait_for_tx, NodePaymentExt,
+	TestChainSource,
 };
+
+#[cfg(feature = "chain-bitcoind")]
+#[test]
+fn bitcoind_rest_follows_valid_reorg() {
+	let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+	rt.block_on(async {
+		let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+		let node = setup_node(&TestChainSource::BitcoindRestSync(&bitcoind), random_config());
+		let (bitcoind, electrs) = (&bitcoind.client, &electrsd.client);
+
+		generate_blocks_and_wait(bitcoind, electrs, 3).await;
+		node.sync_wallets().unwrap();
+		let original_tip = node.status().current_best_block;
+		let fork_block_hash = bitcoind
+			.get_block_hash((original_tip.height - 1) as u64)
+			.expect("failed to get fork block hash")
+			.block_hash()
+			.expect("fork block hash should be present");
+
+		invalidate_blocks(bitcoind, 2);
+		generate_blocks_and_wait(bitcoind, electrs, 3).await;
+		let replacement_tip_hash =
+			bitcoind.best_block_hash().expect("failed to get replacement tip");
+		let replacement_tip_height =
+			bitcoind.get_blockchain_info().expect("failed to get replacement tip height").blocks
+				as u32;
+
+		let _: serde_json::Value = bitcoind
+			.call("reconsiderblock", &[json!(fork_block_hash)])
+			.expect("failed to reconsider original branch");
+		let chain_tips = bitcoind
+			.get_chain_tips()
+			.expect("failed to get chain tips")
+			.into_model()
+			.expect("failed to parse chain tips")
+			.0;
+		assert!(chain_tips.iter().any(|tip| {
+			tip.hash == original_tip.block_hash && tip.status == ChainTipsStatus::ValidFork
+		}));
+		assert!(chain_tips.iter().any(|tip| {
+			tip.hash == replacement_tip_hash && tip.status == ChainTipsStatus::Active
+		}));
+
+		node.sync_wallets()
+			.expect("REST-backed node did not follow Bitcoin Core's replacement chain");
+		let synced_tip = node.status().current_best_block;
+		assert_eq!(
+			synced_tip.block_hash, replacement_tip_hash,
+			"REST-backed node did not follow Bitcoin Core's replacement chain"
+		);
+		assert_eq!(
+			synced_tip.height, replacement_tip_height,
+			"REST-backed node did not follow Bitcoin Core's replacement chain"
+		);
+	})
+}
+
+async fn wait_for_pending_sweep_balance<F>(
+	node: &ldk_node::Node, mut matches_balance: F,
+) -> PendingSweepBalance
+where
+	F: FnMut(&PendingSweepBalance) -> bool,
+{
+	exponential_backoff_poll(|| {
+		node.sync_wallets().unwrap();
+		node.list_balances()
+			.pending_balances_from_channel_closures
+			.into_iter()
+			.find(|balance| matches_balance(balance))
+	})
+	.await
+}
 
 proptest! {
 	#![proptest_config(proptest::test_runner::Config::with_cases(5))]
@@ -29,17 +104,16 @@ proptest! {
 			let chain_source_c = random_chain_source(&bitcoind, &electrsd);
 
 			macro_rules! config_node {
-				($chain_source: expr, $anchor_channels: expr) => {{
-					let config_a = random_config($anchor_channels);
+				($chain_source: expr) => {{
+					let config_a = random_config();
 					let node = setup_node(&$chain_source, config_a);
 					node
 				}};
 			}
-			let anchor_channels = true;
 			let nodes = vec![
-				config_node!(chain_source_a, anchor_channels),
-				config_node!(chain_source_b, anchor_channels),
-				config_node!(chain_source_c, anchor_channels),
+				config_node!(chain_source_a),
+				config_node!(chain_source_b),
+				config_node!(chain_source_c),
 			];
 
 			let (bitcoind, electrs) = (&bitcoind.client, &electrsd.client);
@@ -76,7 +150,9 @@ proptest! {
 				nodes_funding_tx.insert(node.node_id(), funding_txo);
 			}
 
-			generate_blocks_and_wait(bitcoind, electrs, 6).await;
+			// Keep funding confirmed across the deepest reorg. rust-lightning PR #4231 exempts
+			// only trusted zero-conf channels; regular channels still force-close at zero confirmations.
+			generate_blocks_and_wait(bitcoind, electrs, 7).await;
 			sync_wallets!();
 
 			reorg!(reorg_depth);
@@ -102,7 +178,7 @@ proptest! {
 			for (i, node) in nodes.iter().enumerate() {
 				assert_eq!(
 					node
-						.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound
+						.list_payments_matching(|p| p.direction == PaymentDirection::Outbound
 							&& matches!(p.kind, PaymentKind::Onchain { .. }))
 						.len(),
 					1
@@ -144,40 +220,60 @@ proptest! {
 			sync_wallets!();
 
 			if force_close {
-				for node in &nodes {
-					node.sync_wallets().unwrap();
-					// If there is no more balance, there is nothing to process here.
-					if node.list_balances().lightning_balances.len() < 1 {
-						return;
-					}
-					match node.list_balances().lightning_balances[0] {
-						LightningBalance::ClaimableAwaitingConfirmations {
-							confirmation_height,
-							..
-						} => {
-							let cur_height = node.status().current_best_block.height;
-							let blocks_to_go = confirmation_height - cur_height;
-							generate_blocks_and_wait(bitcoind, electrs, blocks_to_go as usize).await;
-							node.sync_wallets().unwrap();
-						},
-						_ => panic!("Unexpected balance state for node_hub!"),
-					}
+				let claimable_nodes = nodes
+					.iter()
+					.filter_map(|node| {
+						node.list_balances().lightning_balances.iter().find_map(|balance| {
+							match balance {
+								LightningBalance::ClaimableAwaitingConfirmations {
+									confirmation_height,
+									..
+								} => Some((node, *confirmation_height)),
+								_ => None,
+							}
+						})
+					})
+					.collect::<Vec<_>>();
+				let confirmation_height = claimable_nodes
+					.iter()
+					.map(|(_, confirmation_height)| *confirmation_height)
+					.max()
+					.expect("Missing claimable force-close balance");
+				let cur_height = nodes[0].status().current_best_block.height;
+				let blocks_to_go = confirmation_height.saturating_sub(cur_height);
+				if blocks_to_go > 0 {
+					generate_blocks_and_wait(bitcoind, electrs, blocks_to_go as usize).await;
+					sync_wallets!();
+				}
 
-					assert!(node.list_balances().lightning_balances.len() < 2);
-					assert!(node.list_balances().pending_balances_from_channel_closures.len() > 0);
-					match node.list_balances().pending_balances_from_channel_closures[0] {
-						PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-						_ => panic!("Unexpected balance state!"),
+				// Mining for one node advances the shared chain for every node. Mature all
+				// claimable outputs together, wait for every sweep to reach the mempool, then
+				// confirm them and wait for `AwaitingThresholdConfirmations`.
+				for (node, _) in &claimable_nodes {
+					let pending_balance = wait_for_pending_sweep_balance(node, |balance| {
+						matches!(
+							balance,
+							PendingSweepBalance::BroadcastAwaitingConfirmation { .. }
+								| PendingSweepBalance::AwaitingThresholdConfirmations { .. }
+						)
+					})
+					.await;
+					if let PendingSweepBalance::BroadcastAwaitingConfirmation {
+						latest_spending_txid,
+						..
+					} = pending_balance
+					{
+						wait_for_tx(electrs, latest_spending_txid).await;
 					}
+				}
 
-					generate_blocks_and_wait(&bitcoind, electrs, 1).await;
-					node.sync_wallets().unwrap();
-					assert!(node.list_balances().lightning_balances.len() < 2);
-					assert!(node.list_balances().pending_balances_from_channel_closures.len() > 0);
-					match node.list_balances().pending_balances_from_channel_closures[0] {
-						PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-						_ => panic!("Unexpected balance state!"),
-					}
+				generate_blocks_and_wait(bitcoind, electrs, 1).await;
+				sync_wallets!();
+				for (node, _) in &claimable_nodes {
+					wait_for_pending_sweep_balance(node, |balance| {
+						matches!(balance, PendingSweepBalance::AwaitingThresholdConfirmations { .. })
+					})
+					.await;
 				}
 			}
 

@@ -1,12 +1,43 @@
 # Pending
 
 ## Compatibility Notes
+- The language bindings now expose `Mnemonic` as an object instead of a string alias. Existing
+  mnemonic phrases must be passed through its fallible constructor, which returns
+  `NodeError::InvalidMnemonic` for invalid input; generated mnemonics can be converted back to a
+  string through their language's standard string conversion.
+- `generate_entropy_mnemonic` has been removed. Use `bip39::Mnemonic::generate` in Rust and
+  `Mnemonic::generate` in the language bindings instead.
+- Migrating between storage backends does not preserve the relative creation order of
+  pre-existing payments, as the generic KV store migration copies entries in an unspecified
+  order. Expect the order in which `Node::list_payments` returns pre-existing payments to
+  change once after such a migration. Payment contents and completeness are unaffected.
 - Pending JIT-channel payments created before upgrading may fail after upgrade because the
   prior LSPS2 fee-limit state stored in `PaymentKind::Bolt11Jit` is not migrated.
+- Upgrading from LDK Node v0.1 is no longer supported if the event queue still contains
+  a persisted `ChannelClosed` event.
 - Users of the VSS storage backend must upgrade their VSS server to at least version
   `v0.1.0-alpha.0` before upgrading LDK Node.
+- The `payment_id` field on the `PaymentSuccessful`, `PaymentFailed`, and
+  `PaymentReceived` events is now a required (non-optional) `PaymentId`. Events
+  persisted by LDK Node v0.2.1 or earlier (which stored `payment_id` as
+  optional) will fail to deserialize on read; users upgrading from those
+  versions need to drain pending events before the upgrade.
+- Applications using the BOLT 11 manual-claiming receive APIs
+  (`receive_*_for_hash`) now need to set
+  `Config::manually_handle_unknown_bolt11_payments` to `true`. Otherwise
+  matching inbound HTLCs will be failed back instead of emitting
+  `Event::PaymentClaimable`.
 
 ## Feature and API updates
+- Language-binding `Mnemonic` objects can be generated or constructed from entropy and expose
+  their words, word indices, word count, entropy, checksum, and passphrase-derived seed.
+- `Node::list_payments` is now paginated: it takes an optional `PageToken` and returns a
+  `PaymentDetailsPage` holding one page of payments, ordered from most recently created to
+  least recently created, plus the token for the next page. Ordering and page tokens come
+  from the configured storage backend, and token lifetime follows that backend's guarantees.
+  This replaces the previous unpaginated `Node::list_payments`, and
+  `Node::list_payments_with_filter` has been removed; filter the returned pages instead.
+- `Node::payment` now returns a `Result`, as retrieving a payment may fail.
 - The Bitcoin Core RPC and REST chain-source builder methods now accept an optional
   `wallet_rescan_from_height` argument. Passing a height lets fresh wallets rescan from a known
   birthday block instead of checkpointing at the current tip, which is useful when restoring a
@@ -16,6 +47,15 @@
 - `EsploraSyncConfig` and `ElectrumSyncConfig` now support `force_wallet_full_scan`. When set,
   the on-chain wallet keeps using BDK `full_scan` instead of incremental sync until a full scan
   succeeds, allowing restored wallets to rediscover funds sent to previously-unknown addresses.
+- The `ChannelDetails` returned by `Node::list_channels` now exposes the negotiated
+  `ChannelTypeFeatures`.
+- `Config::anchor_channels_config` is no longer optional, hence anchor channels can no longer be
+  disabled. We still negotiate legacy channels if the peer does not support anchor channels.
+- `Bolt12Payment::create_payer_proof` allows building a BOLT 12 payer proof for a payment made by
+  this node, with `PayerProofOptions` controlling which optional invoice fields are selectively
+  disclosed. The method is stateless: the payment id, preimage, and invoice are taken from
+  `Event::PaymentSuccessful` and nothing is persisted. Payments settled via a static invoice,
+  i.e., async payments, don't support payer proofs. (#1045)
 
 ## Bug Fixes and Improvements
 - Building a fresh node against a Bitcoin Core RPC or REST chain source that fails to return the

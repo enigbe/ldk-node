@@ -17,13 +17,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use bip39::Mnemonic;
+use bip39::Mnemonic as Bip39Mnemonic;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 pub use bitcoin::{Address, BlockHash, Network, OutPoint, ScriptBuf, Txid};
 pub use lightning::chain::channelmonitor::BalanceSource;
-use lightning::events::PaidBolt12Invoice as LdkPaidBolt12Invoice;
 pub use lightning::events::{ClosureReason, PaymentFailureReason};
 use lightning::ln::channel_state::{ChannelShutdownState, CounterpartyForwardingInfo};
 use lightning::ln::channelmanager::PaymentId;
@@ -32,11 +31,15 @@ pub use lightning::ln::types::ChannelId;
 use lightning::offers::invoice::Bolt12Invoice as LdkBolt12Invoice;
 pub use lightning::offers::offer::OfferId;
 use lightning::offers::offer::{Amount as LdkAmount, Offer as LdkOffer};
+use lightning::offers::payer_proof::{
+	PaidBolt12Invoice as LdkPaidBolt12Invoice, PayerProof as LdkPayerProof,
+};
 use lightning::offers::refund::Refund as LdkRefund;
 use lightning::offers::static_invoice::StaticInvoice as LdkStaticInvoice;
 use lightning::onion_message::dns_resolution::HumanReadableName as LdkHumanReadableName;
 pub use lightning::routing::gossip::{NodeAlias, NodeId, RoutingFees};
 pub use lightning::routing::router::RouteParametersConfig;
+use lightning::util::persist::PageToken as LdkPageToken;
 use lightning::util::ser::{Readable, Writeable, Writer};
 use lightning_invoice::{Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescriptionRef};
 pub use lightning_invoice::{Description, SignedRawBolt11Invoice};
@@ -44,9 +47,13 @@ pub use lightning_liquidity::lsps0::ser::LSPSDateTime;
 pub use lightning_liquidity::lsps1::msgs::{
 	LSPS1ChannelInfo, LSPS1OrderId, LSPS1OrderParams, LSPS1PaymentState,
 };
-use lightning_types::features::{InitFeatures as LdkInitFeatures, NodeFeatures as LdkNodeFeatures};
+use lightning_types::features::{
+	ChannelTypeFeatures as LdkChannelTypeFeatures, InitFeatures as LdkInitFeatures,
+	NodeFeatures as LdkNodeFeatures,
+};
 pub use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 pub use lightning_types::string::UntrustedString;
+#[cfg(feature = "storage-vss")]
 use vss_client::headers::{
 	VssHeaderProvider as VssClientHeaderProvider,
 	VssHeaderProviderError as VssClientHeaderProviderError,
@@ -94,6 +101,7 @@ impl std::fmt::Display for VssHeaderProviderError {
 
 impl std::error::Error for VssHeaderProviderError {}
 
+#[cfg(feature = "storage-vss")]
 impl From<VssHeaderProviderError> for VssClientHeaderProviderError {
 	fn from(e: VssHeaderProviderError) -> Self {
 		match e {
@@ -124,16 +132,19 @@ pub trait VssHeaderProvider: Send + Sync {
 
 /// An adapter that wraps the local [`VssHeaderProvider`] and implements the upstream
 /// [`VssClientHeaderProvider`] trait.
+#[cfg(feature = "storage-vss")]
 pub(crate) struct VssHeaderProviderAdapter {
 	inner: Arc<dyn VssHeaderProvider>,
 }
 
+#[cfg(feature = "storage-vss")]
 impl VssHeaderProviderAdapter {
 	pub(crate) fn new(inner: Arc<dyn VssHeaderProvider>) -> Self {
 		Self { inner }
 	}
 }
 
+#[cfg(feature = "storage-vss")]
 #[async_trait::async_trait]
 impl VssClientHeaderProvider for VssHeaderProviderAdapter {
 	async fn get_headers(
@@ -144,11 +155,11 @@ impl VssClientHeaderProvider for VssHeaderProviderAdapter {
 }
 
 use crate::builder::sanitize_alias;
-pub use crate::config::{default_config, ElectrumSyncConfig, EsploraSyncConfig, TorConfig};
-pub use crate::entropy::{generate_entropy_mnemonic, NodeEntropy, WordCount};
+pub use crate::config::default_config;
 use crate::error::Error;
 pub use crate::liquidity::LSPS1OrderStatus;
 pub use crate::logger::{LogLevel, LogRecord, LogWriter};
+pub use crate::probing::ProbingConfig;
 use crate::{hex_utils, SocketAddress, UserChannelId};
 
 uniffi::custom_type!(PublicKey, String, {
@@ -836,6 +847,17 @@ pub enum PaidBolt12Invoice {
 	Static(Arc<StaticInvoice>),
 }
 
+impl PaidBolt12Invoice {
+	/// Returns the [`Bolt12Invoice`] if the payment was for a standard BOLT 12 invoice, and
+	/// `None` for a static invoice, i.e., an async payment, which can't be proven.
+	pub fn bolt12_invoice(&self) -> Option<Arc<Bolt12Invoice>> {
+		match self {
+			PaidBolt12Invoice::Bolt12(invoice) => Some(Arc::clone(invoice)),
+			PaidBolt12Invoice::Static(_) => None,
+		}
+	}
+}
+
 impl From<LdkPaidBolt12Invoice> for PaidBolt12Invoice {
 	fn from(ldk: LdkPaidBolt12Invoice) -> Self {
 		match ldk {
@@ -874,6 +896,135 @@ impl Readable for PaidBolt12Invoice {
 	fn read<R: lightning::io::Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let ldk_type = LdkPaidBolt12Invoice::read(r)?;
 		Ok(ldk_type.into())
+	}
+}
+
+/// A cryptographic proof that a BOLT12 invoice was paid by this node.
+///
+/// Hand the encoded form, via [`Self::bytes`] or [`Self::as_string`], to whoever needs to verify
+/// it. The remaining accessors expose the fields that were selectively disclosed when the proof
+/// was created.
+#[derive(Debug, Clone, uniffi::Object)]
+#[uniffi::export(Debug, Display)]
+pub struct PayerProof {
+	pub(crate) inner: LdkPayerProof,
+}
+
+#[uniffi::export]
+impl PayerProof {
+	#[uniffi::constructor]
+	pub fn from_bytes(proof_bytes: Vec<u8>) -> Result<Self, Error> {
+		let inner = LdkPayerProof::try_from(proof_bytes).map_err(|_| Error::InvalidPayerProof)?;
+		Ok(Self { inner })
+	}
+
+	/// Parses a payer proof from its bech32-encoded string form, as returned by
+	/// [`Self::as_string`].
+	#[uniffi::constructor]
+	pub fn from_str(proof_str: &str) -> Result<Self, Error> {
+		proof_str.parse()
+	}
+
+	/// The payment preimage proving the payment completed.
+	pub fn payment_preimage(&self) -> PaymentPreimage {
+		self.inner.payment_preimage()
+	}
+
+	/// The payment hash committed to by the invoice and proven by the preimage.
+	pub fn payment_hash(&self) -> PaymentHash {
+		self.inner.payment_hash()
+	}
+
+	/// The public key of the payer that authorized the payment.
+	pub fn payer_signing_pubkey(&self) -> PublicKey {
+		self.inner.payer_signing_pubkey()
+	}
+
+	/// The issuer signing public key committed to by the invoice.
+	pub fn issuer_signing_pubkey(&self) -> PublicKey {
+		self.inner.issuer_signing_pubkey()
+	}
+
+	/// The invoice signature bytes.
+	pub fn invoice_signature(&self) -> Vec<u8> {
+		self.inner.invoice_signature().as_ref().to_vec()
+	}
+
+	/// The proof signature bytes.
+	pub fn proof_signature(&self) -> Vec<u8> {
+		self.inner.proof_signature().as_ref().to_vec()
+	}
+
+	/// The offer description, if it was disclosed in the proof.
+	pub fn offer_description(&self) -> Option<String> {
+		self.inner.offer_description().map(|value| value.to_string())
+	}
+
+	/// The offer issuer, if it was disclosed in the proof.
+	pub fn offer_issuer(&self) -> Option<String> {
+		self.inner.offer_issuer().map(|value| value.to_string())
+	}
+
+	/// The invoice amount in millisatoshis, if it was disclosed in the proof.
+	pub fn invoice_amount_msats(&self) -> Option<u64> {
+		self.inner.invoice_amount_msats()
+	}
+
+	/// The invoice creation time, in seconds since the UNIX epoch, if it was disclosed in the
+	/// proof.
+	pub fn invoice_created_at(&self) -> Option<u64> {
+		self.inner.invoice_created_at().map(|value| value.as_secs())
+	}
+
+	/// The optional note attached to the proof.
+	pub fn proof_note(&self) -> Option<String> {
+		self.inner.proof_note().map(|value| value.to_string())
+	}
+
+	/// The Merkle root committed to by the proof.
+	pub fn merkle_root(&self) -> Vec<u8> {
+		self.inner.merkle_root().to_byte_array().to_vec()
+	}
+
+	/// The raw TLV bytes of the proof.
+	pub fn bytes(&self) -> Vec<u8> {
+		self.inner.bytes().to_vec()
+	}
+
+	/// The bech32-encoded string form of the proof.
+	pub fn as_string(&self) -> String {
+		self.inner.to_string()
+	}
+}
+
+impl From<LdkPayerProof> for PayerProof {
+	fn from(inner: LdkPayerProof) -> Self {
+		Self { inner }
+	}
+}
+
+impl std::str::FromStr for PayerProof {
+	type Err = Error;
+
+	fn from_str(proof_str: &str) -> Result<Self, Self::Err> {
+		proof_str
+			.parse::<LdkPayerProof>()
+			.map(|proof| PayerProof { inner: proof })
+			.map_err(|_| Error::InvalidPayerProof)
+	}
+}
+
+impl Deref for PayerProof {
+	type Target = LdkPayerProof;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl std::fmt::Display for PayerProof {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.inner)
 	}
 }
 
@@ -1004,15 +1155,104 @@ uniffi::custom_type!(BlockHash, String, {
 	},
 });
 
-uniffi::custom_type!(Mnemonic, String, {
-	remote,
-	try_lift: |val| {
-		Ok(Mnemonic::from_str(&val).map_err(|_| Error::InvalidSecretKey)?)
-	},
-	lower: |obj| {
-		obj.to_string()
-	},
-});
+/// A syntactically and semantically valid BIP 39 mnemonic.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
+pub struct Mnemonic {
+	pub(crate) inner: Bip39Mnemonic,
+}
+
+#[uniffi::export]
+impl Mnemonic {
+	/// Constructs a mnemonic from its BIP 39 phrase.
+	#[uniffi::constructor]
+	pub fn from_str(mnemonic_str: &str) -> Result<Self, Error> {
+		mnemonic_str.parse()
+	}
+
+	/// Constructs an English mnemonic from 128-256 bits of entropy.
+	///
+	/// The entropy must be a multiple of 32 bits.
+	#[uniffi::constructor]
+	pub fn from_entropy(entropy: &[u8]) -> Result<Self, Error> {
+		Bip39Mnemonic::from_entropy(entropy).map(Self::from).map_err(|_| Error::InvalidMnemonic)
+	}
+
+	/// Generates a random English mnemonic with the specified word count.
+	#[uniffi::constructor]
+	pub fn generate(word_count: u8) -> Result<Self, Error> {
+		Bip39Mnemonic::generate(word_count.into())
+			.map(Self::from)
+			.map_err(|_| Error::InvalidMnemonic)
+	}
+
+	/// Returns the words in the mnemonic.
+	pub fn words(&self) -> Vec<String> {
+		self.inner.words().map(String::from).collect()
+	}
+
+	/// Returns the indices of the mnemonic's words in the English BIP 39 word list.
+	pub fn word_indices(&self) -> Vec<u16> {
+		self.inner.word_indices().map(|index| index as u16).collect()
+	}
+
+	/// Returns the number of words in the mnemonic.
+	pub fn word_count(&self) -> u8 {
+		self.inner.word_count() as u8
+	}
+
+	/// Returns the entropy used to construct the mnemonic.
+	pub fn to_entropy(&self) -> Vec<u8> {
+		self.inner.to_entropy()
+	}
+
+	/// Derives the 64-byte BIP 39 seed using the given passphrase.
+	pub fn to_seed(&self, passphrase: &str) -> Vec<u8> {
+		self.inner.to_seed(passphrase).to_vec()
+	}
+
+	/// Returns the checksum encoded in the mnemonic's last word.
+	pub fn checksum(&self) -> u8 {
+		self.inner.checksum()
+	}
+}
+
+impl FromStr for Mnemonic {
+	type Err = Error;
+
+	fn from_str(mnemonic_str: &str) -> Result<Self, Self::Err> {
+		mnemonic_str
+			.parse::<Bip39Mnemonic>()
+			.map(|inner| Self { inner })
+			.map_err(|_| Error::InvalidMnemonic)
+	}
+}
+
+impl From<Bip39Mnemonic> for Mnemonic {
+	fn from(inner: Bip39Mnemonic) -> Self {
+		Self { inner }
+	}
+}
+
+impl Deref for Mnemonic {
+	type Target = Bip39Mnemonic;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl AsRef<Bip39Mnemonic> for Mnemonic {
+	fn as_ref(&self) -> &Bip39Mnemonic {
+		self.deref()
+	}
+}
+
+impl std::fmt::Display for Mnemonic {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.inner)
+	}
+}
 
 uniffi::custom_type!(SocketAddress, String, {
 	remote,
@@ -1818,6 +2058,102 @@ impl From<LdkNodeFeatures> for NodeFeatures {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
 #[uniffi::export(Debug, Eq)]
+pub struct ChannelTypeFeatures {
+	pub(crate) inner: LdkChannelTypeFeatures,
+}
+
+#[uniffi::export]
+impl ChannelTypeFeatures {
+	/// Constructs channel type features from big-endian BOLT 9 encoded bytes.
+	#[uniffi::constructor]
+	pub fn from_bytes(bytes: &[u8]) -> Self {
+		Self { inner: LdkChannelTypeFeatures::from_be_bytes(bytes.to_vec()) }
+	}
+
+	/// Returns the BOLT 9 big-endian encoded representation of these features.
+	pub fn to_bytes(&self) -> Vec<u8> {
+		self.inner.encode()
+	}
+
+	/// Whether this channel type advertises support for `option_static_remotekey`.
+	pub fn supports_static_remote_key(&self) -> bool {
+		self.inner.supports_static_remote_key()
+	}
+
+	/// Whether this channel type requires `option_static_remotekey`.
+	pub fn requires_static_remote_key(&self) -> bool {
+		self.inner.requires_static_remote_key()
+	}
+
+	/// Whether this channel type advertises support for `option_anchors_zero_fee_htlc_tx`.
+	pub fn supports_anchors_zero_fee_htlc_tx(&self) -> bool {
+		self.inner.supports_anchors_zero_fee_htlc_tx()
+	}
+
+	/// Whether this channel type requires `option_anchors_zero_fee_htlc_tx`.
+	pub fn requires_anchors_zero_fee_htlc_tx(&self) -> bool {
+		self.inner.requires_anchors_zero_fee_htlc_tx()
+	}
+
+	/// Whether this channel type advertises support for `option_anchors_nonzero_fee_htlc_tx`.
+	pub fn supports_anchors_nonzero_fee_htlc_tx(&self) -> bool {
+		self.inner.supports_anchors_nonzero_fee_htlc_tx()
+	}
+
+	/// Whether this channel type requires `option_anchors_nonzero_fee_htlc_tx`.
+	pub fn requires_anchors_nonzero_fee_htlc_tx(&self) -> bool {
+		self.inner.requires_anchors_nonzero_fee_htlc_tx()
+	}
+
+	/// Whether this channel type advertises support for `option_taproot`.
+	pub fn supports_taproot(&self) -> bool {
+		self.inner.supports_taproot()
+	}
+
+	/// Whether this channel type requires `option_taproot`.
+	pub fn requires_taproot(&self) -> bool {
+		self.inner.requires_taproot()
+	}
+
+	/// Whether this channel type advertises support for `option_scid_alias`.
+	pub fn supports_scid_privacy(&self) -> bool {
+		self.inner.supports_scid_privacy()
+	}
+
+	/// Whether this channel type requires `option_scid_alias`.
+	pub fn requires_scid_privacy(&self) -> bool {
+		self.inner.requires_scid_privacy()
+	}
+
+	/// Whether this channel type advertises support for `option_zeroconf`.
+	pub fn supports_zero_conf(&self) -> bool {
+		self.inner.supports_zero_conf()
+	}
+
+	/// Whether this channel type requires `option_zeroconf`.
+	pub fn requires_zero_conf(&self) -> bool {
+		self.inner.requires_zero_conf()
+	}
+
+	/// Whether this channel type advertises support for `option_zero_fee_commitments`.
+	pub fn supports_anchor_zero_fee_commitments(&self) -> bool {
+		self.inner.supports_anchor_zero_fee_commitments()
+	}
+
+	/// Whether this channel type requires `option_zero_fee_commitments`.
+	pub fn requires_anchor_zero_fee_commitments(&self) -> bool {
+		self.inner.requires_anchor_zero_fee_commitments()
+	}
+}
+
+impl From<LdkChannelTypeFeatures> for ChannelTypeFeatures {
+	fn from(features: LdkChannelTypeFeatures) -> Self {
+		Self { inner: features }
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Eq)]
 pub struct InitFeatures {
 	pub(crate) inner: LdkInitFeatures,
 }
@@ -2188,6 +2524,27 @@ mod tests {
 		let wrapped_invoice = Bolt12Invoice { inner: ldk_invoice.clone() };
 
 		(ldk_invoice, wrapped_invoice)
+	}
+
+	#[test]
+	fn test_channel_type_feature_accessors() {
+		let mut optional = LdkChannelTypeFeatures::empty();
+		optional.set_scid_privacy_optional();
+		optional.set_zero_conf_optional();
+		let optional = ChannelTypeFeatures::from(optional);
+		assert!(optional.supports_scid_privacy());
+		assert!(!optional.requires_scid_privacy());
+		assert!(optional.supports_zero_conf());
+		assert!(!optional.requires_zero_conf());
+
+		let mut required = LdkChannelTypeFeatures::empty();
+		required.set_scid_privacy_required();
+		required.set_zero_conf_required();
+		let required = ChannelTypeFeatures::from(required);
+		assert!(required.supports_scid_privacy());
+		assert!(required.requires_scid_privacy());
+		assert!(required.supports_zero_conf());
+		assert!(required.requires_zero_conf());
 	}
 
 	#[test]
@@ -2622,5 +2979,86 @@ mod tests {
 
 		let hrn3 = hrn1;
 		assert_eq!(hrn1, hrn3);
+	}
+
+	#[test]
+	fn test_mnemonic_traits() {
+		let mnemonic_str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+		let mnemonic = Mnemonic::from_str(mnemonic_str).unwrap();
+		let bip39_mnemonic = Bip39Mnemonic::from_str(mnemonic_str).unwrap();
+
+		assert_eq!(mnemonic.as_ref(), &bip39_mnemonic);
+		assert_eq!(mnemonic.to_string(), mnemonic_str);
+		assert_eq!(mnemonic, Mnemonic::from(bip39_mnemonic));
+		assert!(format!("{:?}", mnemonic).contains("Mnemonic"));
+
+		let invalid_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+		assert_eq!(Mnemonic::from_str(invalid_mnemonic), Err(Error::InvalidMnemonic));
+	}
+
+	#[test]
+	fn test_mnemonic_functionality() {
+		let entropy = [0; 16];
+		let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
+
+		assert_eq!(
+			mnemonic.words(),
+			[vec!["abandon".to_string(); 11], vec!["about".to_string()]].concat()
+		);
+		assert_eq!(mnemonic.word_indices(), [vec![0; 11], vec![3]].concat());
+		assert_eq!(mnemonic.word_count(), 12);
+		assert_eq!(mnemonic.to_entropy(), entropy);
+		assert_eq!(mnemonic.checksum(), 3);
+		assert_eq!(mnemonic.to_seed("TREZOR").len(), 64);
+		assert_eq!(Mnemonic::generate(12).unwrap().word_count(), 12);
+		assert_eq!(Mnemonic::generate(13), Err(Error::InvalidMnemonic));
+		assert_eq!(Mnemonic::from_entropy(&[0; 15]), Err(Error::InvalidMnemonic));
+	}
+}
+
+/// An opaque token used to continue a paginated listing.
+///
+/// Obtain one from the page returned by a listing call and pass it back to retrieve the next page.
+/// The value returned by `to_string` may be persisted and handed to the constructor later, so that
+/// pagination can be resumed after a restart.
+///
+/// The representation is defined by the storage backend and must be treated as opaque. A token is
+/// only meaningful to the backend that issued it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
+pub struct PageToken {
+	pub(crate) inner: LdkPageToken,
+}
+
+#[uniffi::export]
+impl PageToken {
+	/// Constructs a token from the representation previously obtained via `to_string`.
+	#[uniffi::constructor]
+	pub fn new(token: String) -> Self {
+		Self { inner: LdkPageToken::new(token) }
+	}
+}
+
+impl From<LdkPageToken> for PageToken {
+	fn from(inner: LdkPageToken) -> Self {
+		Self { inner }
+	}
+}
+
+impl From<PageToken> for LdkPageToken {
+	fn from(wrapper: PageToken) -> Self {
+		wrapper.inner
+	}
+}
+
+impl AsRef<LdkPageToken> for PageToken {
+	fn as_ref(&self) -> &LdkPageToken {
+		&self.inner
+	}
+}
+
+impl std::fmt::Display for PageToken {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.inner)
 	}
 }
