@@ -7,8 +7,13 @@
 
 //! Objects related to [`SqliteStore`] live here.
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::future::Future;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +25,7 @@ use lightning::util::persist::{
 use lightning_types::string::PrintableString;
 use rusqlite::{named_params, Connection};
 
-use crate::io::utils::check_namespace_key_validity;
+use crate::io::utils::{check_namespace_key_validity, create_dir_all_private};
 
 mod migrations;
 
@@ -57,6 +62,8 @@ impl SqliteStore {
 	///
 	/// If not already existing, a new SQLite database will be created in the given `data_dir` under the
 	/// given `db_file_name` (or the default to [`DEFAULT_SQLITE_DB_FILE_NAME`] if set to `None`).
+	///
+	/// SQLite's `:memory:` database name and `file:` URI filenames are not supported.
 	///
 	/// Similarly, the given `kv_table_name` will be used or default to [`DEFAULT_KV_TABLE_NAME`].
 	pub fn new(
@@ -232,9 +239,20 @@ impl SqliteStoreInner {
 		data_dir: PathBuf, db_file_name: Option<String>, kv_table_name: Option<String>,
 	) -> io::Result<Self> {
 		let db_file_name = db_file_name.unwrap_or(DEFAULT_SQLITE_DB_FILE_NAME.to_string());
+		let mut db_file_path = data_dir.clone();
+		db_file_path.push(&db_file_name);
+		if db_file_name == ":memory:"
+			|| db_file_name.starts_with("file:")
+			|| db_file_path.to_string_lossy().starts_with("file:")
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"SQLite :memory: and file: database names are not supported",
+			));
+		}
 		let kv_table_name = kv_table_name.unwrap_or(DEFAULT_KV_TABLE_NAME.to_string());
 
-		fs::create_dir_all(data_dir.clone()).map_err(|e| {
+		create_dir_all_private(&data_dir).map_err(|e| {
 			let msg = format!(
 				"Failed to create database destination directory {}: {}",
 				data_dir.display(),
@@ -242,8 +260,16 @@ impl SqliteStoreInner {
 			);
 			io::Error::new(io::ErrorKind::Other, msg)
 		})?;
-		let mut db_file_path = data_dir.clone();
-		db_file_path.push(db_file_name);
+		#[cfg(unix)]
+		match OpenOptions::new().create_new(true).write(true).mode(0o600).open(&db_file_path) {
+			Ok(_) => {},
+			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+			Err(e) => {
+				let msg =
+					format!("Failed to create database file {}: {}", db_file_path.display(), e);
+				return Err(io::Error::new(io::ErrorKind::Other, msg));
+			},
+		}
 
 		let mut connection = Connection::open(db_file_path.clone()).map_err(|e| {
 			let msg =
@@ -697,6 +723,50 @@ mod tests {
 				Err(e) => println!("Failed to remove test store directory: {}", e),
 				_ => {},
 			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn creates_private_database_storage() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let mut data_dir = random_storage_path();
+		data_dir.push("creates_private_database_storage");
+		let db_file_name = "test_db";
+		let db_file_path = data_dir.join(db_file_name);
+		let _store = SqliteStore::new(
+			data_dir.clone(),
+			Some(db_file_name.to_string()),
+			Some("test_table".to_string()),
+		)
+		.unwrap();
+
+		let dir_mode = data_dir.metadata().unwrap().permissions().mode();
+		let file_mode = db_file_path.metadata().unwrap().permissions().mode();
+		assert_eq!(dir_mode & 0o077, 0);
+		assert_eq!(file_mode & 0o077, 0);
+	}
+
+	#[test]
+	fn rejects_sqlite_pseudo_filenames() {
+		for (data_dir, db_file_name) in [
+			(random_storage_path(), ":memory:"),
+			(random_storage_path(), "file:/tmp/node.db?mode=rwc"),
+			(PathBuf::from("file:."), "test_db"),
+		] {
+			let result = SqliteStore::new(
+				data_dir.clone(),
+				Some(db_file_name.to_string()),
+				Some("test_table".to_string()),
+			);
+			let error = match result {
+				Ok(_) => panic!("SQLite pseudo-filename was accepted"),
+				Err(e) => e,
+			};
+
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert!(!data_dir.exists());
 		}
 	}
 

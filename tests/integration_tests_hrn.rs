@@ -13,7 +13,7 @@ use bitcoin::Amount;
 use common::{
 	expect_channel_ready_event, expect_payment_successful_event, generate_blocks_and_wait,
 	open_channel, premine_and_distribute_funds, random_chain_source, setup_bitcoind_and_electrsd,
-	setup_two_nodes, TestChainSource,
+	setup_two_nodes,
 };
 use ldk_node::payment::UnifiedPaymentResult;
 use ldk_node::Event;
@@ -24,7 +24,7 @@ async fn unified_send_to_hrn() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
 
-	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
 
 	let address_a = node_a.onchain_payment().new_address().unwrap();
 	let premined_sats = 5_000_000;
@@ -79,5 +79,5 @@ async fn unified_send_to_hrn() {
 			},
 		};
 
-	expect_payment_successful_event!(node_a, Some(offer_payment_id), None);
+	expect_payment_successful_event!(node_a, offer_payment_id, None);
 }

@@ -57,6 +57,8 @@ pub enum Error {
 	WalletOperationFailed,
 	/// A wallet operation timed out.
 	WalletOperationTimeout,
+	/// Creating a payer proof failed.
+	PayerProofCreationFailed,
 	/// A signing operation for transaction failed.
 	OnchainTxSigningFailed,
 	/// A transaction sync operation failed.
@@ -79,12 +81,18 @@ pub enum Error {
 	InvalidPublicKey,
 	/// The given secret key is invalid.
 	InvalidSecretKey,
+	/// The given BIP 39 mnemonic is invalid.
+	InvalidMnemonic,
 	/// The given offer id is invalid.
 	InvalidOfferId,
 	/// The given node id is invalid.
 	InvalidNodeId,
 	/// The given payment id is invalid.
 	InvalidPaymentId,
+	/// The given forwarded payment id is invalid.
+	InvalidForwardedPaymentId,
+	/// The given channel-pair forwarding statistics id is invalid.
+	InvalidChannelPairForwardingStatsId,
 	/// The given payment hash is invalid.
 	InvalidPaymentHash,
 	/// The given payment pre-image is invalid.
@@ -115,6 +123,8 @@ pub enum Error {
 	InvalidFeeRate,
 	/// The given script public key is invalid.
 	InvalidScriptPubKey,
+	/// The given page token is invalid.
+	InvalidPageToken,
 	/// A payment with the given hash has already been initiated.
 	DuplicatePayment,
 	/// The provided offer was denonminated in an unsupported currency.
@@ -137,6 +147,10 @@ pub enum Error {
 	LnurlAuthTimeout,
 	/// The provided lnurl is invalid.
 	InvalidLnurl,
+	/// The configured chain source is not supported.
+	ChainSourceNotSupported,
+	/// The provided payer proof is invalid.
+	InvalidPayerProof,
 }
 
 impl fmt::Display for Error {
@@ -168,6 +182,7 @@ impl fmt::Display for Error {
 			},
 			Self::WalletOperationFailed => write!(f, "Failed to conduct wallet operation."),
 			Self::WalletOperationTimeout => write!(f, "A wallet operation timed out."),
+			Self::PayerProofCreationFailed => write!(f, "Failed to create payer proof."),
 			Self::OnchainTxSigningFailed => write!(f, "Failed to sign given transaction."),
 			Self::TxSyncFailed => write!(f, "Failed to sync transactions."),
 			Self::TxSyncTimeout => write!(f, "Syncing transactions timed out."),
@@ -179,9 +194,16 @@ impl fmt::Display for Error {
 			Self::InvalidSocketAddress => write!(f, "The given network address is invalid."),
 			Self::InvalidPublicKey => write!(f, "The given public key is invalid."),
 			Self::InvalidSecretKey => write!(f, "The given secret key is invalid."),
+			Self::InvalidMnemonic => write!(f, "The given BIP 39 mnemonic is invalid."),
 			Self::InvalidOfferId => write!(f, "The given offer id is invalid."),
 			Self::InvalidNodeId => write!(f, "The given node id is invalid."),
 			Self::InvalidPaymentId => write!(f, "The given payment id is invalid."),
+			Self::InvalidForwardedPaymentId => {
+				write!(f, "The given forwarded payment id is invalid.")
+			},
+			Self::InvalidChannelPairForwardingStatsId => {
+				write!(f, "The given channel-pair forwarding statistics id is invalid.")
+			},
 			Self::InvalidPaymentHash => write!(f, "The given payment hash is invalid."),
 			Self::InvalidPaymentPreimage => write!(f, "The given payment preimage is invalid."),
 			Self::InvalidPaymentSecret => write!(f, "The given payment secret is invalid."),
@@ -197,6 +219,7 @@ impl fmt::Display for Error {
 			Self::InvalidDateTime => write!(f, "The given date time is invalid."),
 			Self::InvalidFeeRate => write!(f, "The given fee rate is invalid."),
 			Self::InvalidScriptPubKey => write!(f, "The given script pubkey is invalid."),
+			Self::InvalidPageToken => write!(f, "The given page token is invalid."),
 			Self::DuplicatePayment => {
 				write!(f, "A payment with the given hash has already been initiated.")
 			},
@@ -222,6 +245,10 @@ impl fmt::Display for Error {
 			Self::LnurlAuthFailed => write!(f, "LNURL-auth authentication failed."),
 			Self::LnurlAuthTimeout => write!(f, "LNURL-auth authentication timed out."),
 			Self::InvalidLnurl => write!(f, "The provided lnurl is invalid."),
+			Self::ChainSourceNotSupported => {
+				write!(f, "The configured chain source is not supported.")
+			},
+			Self::InvalidPayerProof => write!(f, "The provided payer proof is invalid."),
 		}
 	}
 }
@@ -262,6 +289,7 @@ impl From<BdkChainCalculateFeeError> for Error {
 	}
 }
 
+#[cfg(any(feature = "chain-esplora", feature = "chain-electrum"))]
 impl From<lightning_transaction_sync::TxSyncError> for Error {
 	fn from(_e: lightning_transaction_sync::TxSyncError) -> Self {
 		Self::TxSyncFailed

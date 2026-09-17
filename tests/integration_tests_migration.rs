@@ -7,7 +7,7 @@
 
 // The migration test exercises the filesystem, SQLite, and Postgres stores. It is gated on the
 // `postgres` feature because Postgres is the only one of the three that needs an external service.
-#![cfg(feature = "postgres")]
+#![cfg(feature = "storage-postgres")]
 
 mod common;
 
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use common::{
 	drop_table, expect_channel_ready_event, expect_payment_received_event,
-	expect_payment_successful_event, test_connection_string,
+	expect_payment_successful_event, test_connection_string, NodePaymentExt,
 };
 use ldk_node::entropy::NodeEntropy;
 use ldk_node::io::postgres_store::PostgresStore;
@@ -65,7 +65,7 @@ impl BackendInstance {
 }
 
 macro_rules! with_opened_store {
-	($instance:expr, |$store:ident| $body:expr) => {{
+	($instance:expr, | $store:ident | $body:expr) => {{
 		let instance = $instance;
 		match instance.backend {
 			MigrationBackend::FilesystemStore => {
@@ -88,10 +88,12 @@ macro_rules! with_opened_store {
 async fn build_migration_node(
 	instance: &BackendInstance, node_config: ldk_node::config::Config, node_entropy: NodeEntropy,
 	esplora_url: &str,
-) -> ldk_node::Node {
+) -> common::TestNode {
 	let mut builder = Builder::from_config(node_config);
 	builder.set_chain_source_esplora(esplora_url.to_string(), None);
-	with_opened_store!(instance, |store| builder.build_with_store(node_entropy, store).unwrap())
+	with_opened_store!(instance, |store| builder
+		.build_with_store(node_entropy.into(), store)
+		.unwrap())
 }
 
 fn open_fs_store(data_dir: &str) -> FilesystemStoreV2 {
@@ -148,7 +150,7 @@ async fn migrate_node_across_all_backends() {
 	let connection_string = test_connection_string();
 
 	// Set up node B, the Lightning counterparty.
-	let config_b = common::random_config(false);
+	let config_b = common::random_config();
 	let node_b_instance = BackendInstance::new(
 		MigrationBackend::Postgres,
 		&config_b.node_config.storage_dir_path,
@@ -167,7 +169,7 @@ async fn migrate_node_across_all_backends() {
 	// Spin up the node we'll migrate on the first backend. The same node config (storage dir,
 	// listening addresses, identity) is reused across every hop — only the backend changes — so
 	// each backend's store lives in its own subdirectory of the one storage dir.
-	let config = common::random_config(false);
+	let config = common::random_config();
 	let node_entropy = config.node_entropy;
 	let node_config = config.node_config;
 	let base_dir = node_config.storage_dir_path.clone();
@@ -203,7 +205,7 @@ async fn migrate_node_across_all_backends() {
 		Bolt11InvoiceDescription::Direct(Description::new("ln send".to_string()).unwrap());
 	let invoice = node_b.bolt11_payment().receive(10_000, &description.into(), 3600).unwrap();
 	let ln_send_id = node.bolt11_payment().send(&invoice, None).unwrap();
-	expect_payment_successful_event!(node, Some(ln_send_id), None);
+	expect_payment_successful_event!(node, ln_send_id, None);
 	expect_payment_received_event!(node_b, 10_000);
 
 	// Lightning receive: node B -> node.
@@ -211,7 +213,7 @@ async fn migrate_node_across_all_backends() {
 		Bolt11InvoiceDescription::Direct(Description::new("ln receive".to_string()).unwrap());
 	let invoice = node.bolt11_payment().receive(5_000, &description.into(), 3600).unwrap();
 	let ln_receive_id = node_b.bolt11_payment().send(&invoice, None).unwrap();
-	expect_payment_successful_event!(node_b, Some(ln_receive_id), None);
+	expect_payment_successful_event!(node_b, ln_receive_id, None);
 	expect_payment_received_event!(node, 5_000);
 
 	// On-chain send: node -> a foreign address.
@@ -224,7 +226,7 @@ async fn migrate_node_across_all_backends() {
 	// Capture the state we expect to survive every migration.
 	let expected_balance_sats = node.list_balances().total_onchain_balance_sats;
 	let expected_ln_balance_sats = node.list_balances().total_lightning_balance_sats;
-	let mut expected_payments = node.list_payments();
+	let mut expected_payments = node.list_all_payments();
 	expected_payments.sort_by_key(|p| p.id.0);
 	assert!(expected_payments.len() >= 4);
 
@@ -249,7 +251,7 @@ async fn migrate_node_across_all_backends() {
 		assert_eq!(node.list_balances().total_onchain_balance_sats, expected_balance_sats);
 		assert_eq!(node.list_balances().total_lightning_balance_sats, expected_ln_balance_sats);
 		assert_eq!(node.list_channels().len(), 1);
-		let mut migrated_payments = node.list_payments();
+		let mut migrated_payments = node.list_all_payments();
 		migrated_payments.sort_by_key(|p| p.id.0);
 		assert_eq!(migrated_payments, expected_payments);
 

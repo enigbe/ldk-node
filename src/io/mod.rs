@@ -7,12 +7,17 @@
 
 //! Objects and traits for data persistence.
 
-#[cfg(feature = "postgres")]
+#[cfg(feature = "storage-filesystem")]
+pub(crate) mod fs_store;
+#[cfg(feature = "storage-postgres")]
 pub mod postgres_store;
+#[cfg(feature = "storage-sqlite")]
 pub mod sqlite_store;
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod tier_store;
 pub(crate) mod utils;
+#[cfg(feature = "storage-vss")]
 pub mod vss_store;
 
 /// The event queue will be persisted under this key.
@@ -32,6 +37,15 @@ pub(crate) const PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 /// The pending payment information will be persisted under this prefix.
 pub(crate) const PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE: &str = "pending_payments";
 pub(crate) const PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+
+/// Forwarded payment information is persisted under this primary namespace.
+pub(crate) const FORWARDED_PAYMENT_PERSISTENCE_PRIMARY_NAMESPACE: &str = "forwarded_payments";
+pub(crate) const FORWARDED_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE: &str = "details";
+pub(crate) const FORWARDED_PAYMENT_REPLAY_MARKER_PERSISTENCE_SECONDARY_NAMESPACE: &str =
+	"replay_markers";
+pub(crate) const CHANNEL_FORWARDING_STATS_PERSISTENCE_SECONDARY_NAMESPACE: &str = "channel_stats";
+pub(crate) const CHANNEL_PAIR_FORWARDING_STATS_PERSISTENCE_SECONDARY_NAMESPACE: &str =
+	"channel_pair_stats";
 
 /// The node metrics will be persisted under this key.
 pub(crate) const NODE_METRICS_PRIMARY_NAMESPACE: &str = "";
@@ -79,6 +93,11 @@ pub(crate) const BDK_WALLET_TX_GRAPH_KEY: &str = "tx_graph";
 pub(crate) const BDK_WALLET_INDEXER_PRIMARY_NAMESPACE: &str = "bdk_wallet";
 pub(crate) const BDK_WALLET_INDEXER_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const BDK_WALLET_INDEXER_KEY: &str = "indexer";
+
+/// The derivation indices of the wallet's address pool will be persisted under this key.
+pub(crate) const BDK_WALLET_ADDRESS_POOL_PRIMARY_NAMESPACE: &str = "bdk_wallet";
+pub(crate) const BDK_WALLET_ADDRESS_POOL_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const BDK_WALLET_ADDRESS_POOL_KEY: &str = "address_pool";
 
 /// [`StaticInvoice`]s will be persisted under this key.
 ///

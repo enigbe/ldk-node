@@ -98,7 +98,7 @@ def send_to_address(address, amount_sats):
 
 
 def setup_node(tmp_dir, esplora_endpoint, listening_addresses):
-    mnemonic = generate_entropy_mnemonic(None)
+    mnemonic = Mnemonic.generate(WordCount.WORDS24)
     node_entropy = NodeEntropy.from_bip39_mnemonic(mnemonic, None)
     config = default_config()
     builder = Builder.from_config(config)
@@ -205,6 +205,64 @@ def init_features_exposed(test_case, init_features):
     test_case.assertIsInstance(init_features.initial_routing_sync(), bool)
 
 
+class TestMnemonic(unittest.TestCase):
+    def test_mnemonic_word_counts(self):
+        word_count_type = globals().get("WordCount")
+        self.assertIsNotNone(word_count_type, "Mnemonic generation must expose WordCount")
+
+        for word_count, expected_words, expected_entropy_bytes in [
+            (word_count_type.WORDS12, 12, 16),
+            (word_count_type.WORDS15, 15, 20),
+            (word_count_type.WORDS18, 18, 24),
+            (word_count_type.WORDS21, 21, 28),
+            (word_count_type.WORDS24, 24, 32),
+        ]:
+            with self.subTest(word_count=word_count):
+                mnemonic = Mnemonic.generate(word_count)
+                self.assertEqual(mnemonic.word_count(), expected_words)
+                self.assertEqual(len(mnemonic.words()), expected_words)
+                self.assertEqual(len(mnemonic.to_entropy()), expected_entropy_bytes)
+                self.assertEqual(Mnemonic.from_entropy(mnemonic.to_entropy()), mnemonic)
+                self.assertEqual(Mnemonic.from_str(str(mnemonic)), mnemonic)
+
+    def test_invalid_mnemonic_returns_node_error(self):
+        invalid_mnemonic = "abandon " * 11 + "abandon"
+        mnemonic_constructor = getattr(Mnemonic, "from_str", Mnemonic)
+
+        with self.assertRaises(NodeError) as error:
+            mnemonic_constructor(invalid_mnemonic)
+
+        self.assertIsInstance(error.exception, NodeError.InvalidMnemonic)
+
+    def test_mnemonic_round_trip(self):
+        mnemonic = Mnemonic.generate(WordCount.WORDS24)
+        parsed_mnemonic = Mnemonic.from_str(str(mnemonic))
+
+        self.assertIsInstance(mnemonic, Mnemonic)
+        self.assertEqual(parsed_mnemonic, mnemonic)
+        self.assertIsInstance(NodeEntropy.from_bip39_mnemonic(parsed_mnemonic, None), NodeEntropy)
+
+    def test_mnemonic_functionality(self):
+        entropy = bytes(16)
+        mnemonic = Mnemonic.from_entropy(entropy)
+
+        self.assertEqual(mnemonic.words(), ["abandon"] * 11 + ["about"])
+        self.assertEqual(mnemonic.word_indices(), [0] * 11 + [3])
+        self.assertEqual(mnemonic.word_count(), 12)
+        self.assertEqual(mnemonic.to_entropy(), entropy)
+        self.assertEqual(mnemonic.checksum(), 3)
+        self.assertEqual(
+            mnemonic.to_seed("TREZOR").hex(),
+            "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e5349553"
+            "1f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04",
+        )
+        self.assertEqual(Mnemonic.generate(WordCount.WORDS12).word_count(), 12)
+
+        with self.assertRaises(NodeError) as error:
+            Mnemonic.from_entropy(bytes(15))
+
+        self.assertIsInstance(error.exception, NodeError.InvalidMnemonic)
+
 
 class TestLdkNode(unittest.TestCase):
     def setUp(self):
@@ -235,7 +293,7 @@ class TestLdkNode(unittest.TestCase):
         self.assertEqual(received_event.custom_records, custom_tlvs)
 
         sender_payment = node_1.payment(keysend_payment_id)
-        receiver_payment = node_2.payment(keysend_payment_id)
+        receiver_payment = node_2.payment(received_event.payment_id)
 
         self.assertIsNotNone(sender_payment)
         self.assertIsNotNone(receiver_payment)

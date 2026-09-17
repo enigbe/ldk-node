@@ -33,8 +33,7 @@ use crate::config::HRN_RESOLUTION_TIMEOUT_SECS;
 use crate::error::Error;
 use crate::ffi::maybe_wrap;
 use crate::logger::{log_error, LdkLogger, Logger};
-use crate::payment::{Bolt11Payment, Bolt12Payment, OnchainPayment};
-use crate::types::HRNResolver;
+use crate::payment::{Bolt11Payment, Bolt12Payment, HRNResolver, OnchainPayment};
 use crate::Config;
 
 type Uri<'a> = bip21::Uri<'a, NetworkChecked, Extras>;
@@ -72,6 +71,7 @@ pub struct UnifiedPayment {
 	onchain_payment: Arc<OnchainPayment>,
 	bolt11_invoice: Arc<Bolt11Payment>,
 	bolt12_payment: Arc<Bolt12Payment>,
+	#[cfg(not(hrn_tests))]
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 	hrn_resolver: HRNResolver,
@@ -85,10 +85,14 @@ impl UnifiedPayment {
 		bolt12_payment: Arc<Bolt12Payment>, config: Arc<Config>, logger: Arc<Logger>,
 		hrn_resolver: HRNResolver,
 	) -> Self {
+		#[cfg(hrn_tests)]
+		let _ = config;
+
 		Self {
 			onchain_payment,
 			bolt11_invoice,
 			bolt12_payment,
+			#[cfg(not(hrn_tests))]
 			config,
 			logger,
 			hrn_resolver,
@@ -287,9 +291,22 @@ impl UnifiedPayment {
 
 					let payment_result = if let Ok(hrn) = HumanReadableName::from_encoded(uri_str) {
 						let hrn = maybe_wrap(hrn.clone());
-						self.bolt12_payment.send_using_amount_inner(&offer, amount_msat.unwrap_or(0), None, None, route_parameters, Some(hrn))
+						self.bolt12_payment.send_using_amount_inner(
+							&offer,
+							amount_msat.unwrap_or(0),
+							None,
+							None,
+							route_parameters,
+							Some(hrn),
+						)
 					} else if let Some(amount_msat) = amount_msat {
-						self.bolt12_payment.send_using_amount(&offer, amount_msat, None, None, route_parameters)
+						self.bolt12_payment.send_using_amount(
+							&offer,
+							amount_msat,
+							None,
+							None,
+							route_parameters,
+						)
 					} else {
 						self.bolt12_payment.send(&offer, None, None, route_parameters)
 					}
@@ -304,14 +321,29 @@ impl UnifiedPayment {
 				},
 				PaymentMethod::LightningBolt11(invoice) => {
 					let invoice = maybe_wrap(invoice.clone());
-					let payment_result = self.bolt11_invoice.send(&invoice, route_parameters)
-						.map_err(|e| {
-							log_error!(self.logger, "Failed to send BOLT11 invoice: {:?}. This is part of a unified payment. Falling back to the on-chain transaction.", e);
-							e
-						});
+					let payment_result = self.bolt11_invoice.send(&invoice, route_parameters);
 
-					if let Ok(payment_id) = payment_result {
-						return Ok(UnifiedPaymentResult::Bolt11 { payment_id });
+					match payment_result {
+						Ok(payment_id) => {
+							return Ok(UnifiedPaymentResult::Bolt11 { payment_id });
+						},
+						// A duplicate payment already exists, so falling back to the
+						// on-chain method would pay the same invoice a second time.
+						Err(Error::DuplicatePayment) => {
+							log_error!(self.logger, "Failed to send BOLT11 invoice: DuplicatePayment. This is part of a unified payment. Aborting to avoid duplicate payment.");
+							return Err(Error::DuplicatePayment);
+						},
+						// A persistence failure may occur after the Lightning payment has
+						// already been initiated with the ChannelManager. Falling back to
+						// the on-chain method in that case would double-pay, so we abort
+						// instead of proceeding to the next payment method.
+						Err(Error::PersistenceFailed) => {
+							log_error!(self.logger, "Failed to send BOLT11 invoice: PersistenceFailed. This is part of a unified payment. Aborting to avoid a potential duplicate payment.");
+							return Err(Error::PersistenceFailed);
+						},
+						Err(e) => {
+							log_error!(self.logger, "Failed to send BOLT11 invoice: {:?}. This is part of a unified payment. Falling back to the on-chain transaction.", e);
+						},
 					}
 				},
 				PaymentMethod::OnChain(address) => {
@@ -328,7 +360,10 @@ impl UnifiedPayment {
 						Error::InvalidAmount
 					})?;
 
-					let txid = self.onchain_payment.send_to_address(&address, amt_sats, None)?;
+					let txid = self
+						.onchain_payment
+						.send_to_address_inner(&address, amt_sats, None)
+						.await?;
 					return Ok(UnifiedPaymentResult::Onchain { txid });
 				},
 			}
