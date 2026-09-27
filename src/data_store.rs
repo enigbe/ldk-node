@@ -223,10 +223,9 @@ where
 
 #[cfg(test)]
 mod tests {
-	use lightning::impl_writeable_tlv_based;
-	use lightning::io;
 	use lightning::util::persist::{PageToken, PaginatedKVStore, PaginatedListResponse};
 	use lightning::util::test_utils::TestLogger;
+	use lightning::{impl_writeable_tlv_based, io};
 
 	use super::*;
 	use crate::hex_utils;
@@ -293,7 +292,8 @@ mod tests {
 	impl KVStore for FailingStore {
 		fn read(
 			&self, _primary_namespace: &str, _secondary_namespace: &str, _key: &str,
-		) -> impl std::future::Future<Output = Result<Vec<u8>, io::Error>> + 'static + Send {
+		) -> impl std::future::Future<Output = Result<Vec<u8>, io::Error>> + 'static + Send
+		{
 			async { Err(io::Error::new(io::ErrorKind::Other, "read failed")) }
 		}
 
@@ -311,7 +311,8 @@ mod tests {
 
 		fn list(
 			&self, _primary_namespace: &str, _secondary_namespace: &str,
-		) -> impl std::future::Future<Output = Result<Vec<String>, io::Error>> + 'static + Send {
+		) -> impl std::future::Future<Output = Result<Vec<String>, io::Error>> + 'static + Send
+		{
 			async { Err(io::Error::new(io::ErrorKind::Other, "list failed")) }
 		}
 	}
